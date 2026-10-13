@@ -5,15 +5,37 @@
   "learn_from_scratch": true,
   "recursive_self_improvement": true,
   "agents": [
-    {"name": "Coordinator", "role": "orchestrator"},
-    {"name": "Learner", "role": "knowledge"},
-    {"name": "Builder", "role": "improvement"},
-    {"name": "Guardian", "role": "safety"}
+    {
+      "name": "ExploitAgent",
+      "role": "exploitation"
+    },
+    {
+      "name": "AnalysisAgent",
+      "role": "analysis"
+    },
+    {
+      "name": "ReconAgent",
+      "role": "surface-mapping"
+    },
+    {
+      "name": "VulnAgent",
+      "role": "vulnerability-research"
+    },
+    {
+      "name": "DefenseAgent",
+      "role": "defense"
+    }
   ],
   "bootstrap": {
     "empty_memory": true,
     "seed_rules_only": true,
     "validation_required": true
   },
-  "license": "MIT"
+  "license": "MIT",
+  "domain": "cybersecurity-only",
+  "tasks": [
+    "exploitation",
+    "analysis",
+    "parallel-spawn"
+  ]
 }

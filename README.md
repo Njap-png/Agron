@@ -67,3 +67,15 @@ Agron can push validated improvements to:
 Agron's initial LLM has now been trained **from scratch** on WikiText-2 using a 4-layer, 256-dim, 4-head LLaMA-style architecture (about **8.4M parameters**). Training artifacts and weights are committed in this repository, including `model.safetensors`, tokenizer files, and the checkpoint.
 
 Future recursive self-improvement can fine-tune or grow this base model.
+
+## Cybersecurity Focus
+
+Agron and its spawned agents are constrained to **cybersecurity exploitation and analysis only**:
+
+- Exploitation (authorized targets, CVEs, payloads)
+- Vulnerability analysis and research
+- Reverse engineering and malware analysis
+- Network / host / application reconnaissance
+- Defensive hardening and detection engineering
+
+Agents can be **spawned in parallel** for tasks using the built-in multi-agent orchestration.

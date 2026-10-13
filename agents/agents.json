@@ -1,6 +1,7 @@
 [
-  {"id":"coordinator","name":"Coordinator","role":"orchestration","memory_scope":"global"},
-  {"id":"learner","name":"Learner","role":"knowledge","memory_scope":"global"},
-  {"id":"builder","name":"Builder","role":"improvement","memory_scope":"global"},
-  {"id":"guardian","name":"Guardian","role":"safety","memory_scope":"global"}
+  {"id":"exploit","name":"ExploitAgent","role":"exploitation","scope":"cybersecurity-only","capabilities":["exploit analysis","payload crafting","cve triage"]},
+  {"id":"analysis","name":"AnalysisAgent","role":"analysis","scope":"cybersecurity-only","capabilities":["reverse engineering","malware analysis","traffic analysis"]},
+  {"id":"recon","name":"ReconAgent","role":"surface-mapping","scope":"cybersecurity-only","capabilities":["osint","dns","subdomain enumeration"]},
+  {"id":"vuln","name":"VulnAgent","role":"vulnerability-research","scope":"cybersecurity-only","capabilities":["vuln scanning","fuzzing","reporting"]},
+  {"id":"defense","name":"DefenseAgent","role":"defense","scope":"cybersecurity-only","capabilities":["hardening","detection","incident response"]}
 ]
