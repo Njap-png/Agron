@@ -1,0 +1,13 @@
+{
+  "model": "Agron",
+  "run": "wikitext-103-subset-50k",
+  "steps": [
+    {"step": 50, "loss": 7.461},
+    {"step": 100, "loss": 7.509},
+    {"step": 150, "loss": 7.461},
+    {"step": 200, "loss": 7.831},
+    {"step": 250, "loss": 8.117},
+    {"step": 300, "loss": 8.594}
+  ],
+  "notes": "Larger run: 8 layers, hidden 512, 1000 steps with 50k lines; early training artifacts retained"
+}
