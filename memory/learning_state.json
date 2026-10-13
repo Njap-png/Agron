@@ -1,9 +1,8 @@
 {
-  "generation": 2,
-  "episodes": 2,
+  "generation": 3,
+  "episodes": 3,
   "knowledge_entries": 16384,
-  "improvements": [
-    "trained ~?M-param LLaMA from scratch on 50k wikitext-103 lines"
-  ],
-  "status": "trained-bigger"
+  "learned_sources": ["wikitext", "FineWeb-Edu", "OWASP", "PortSwigger", "MITRE ATT&CK"],
+  "improvements": ["continued training", "cyber knowledge ingestion"],
+  "status": "self-learning and growing"
 }
