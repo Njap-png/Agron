@@ -79,3 +79,15 @@ Agron and its spawned agents are constrained to **cybersecurity exploitation and
 - Defensive hardening and detection engineering
 
 Agents can be **spawned in parallel** for tasks using the built-in multi-agent orchestration.
+
+## LLM + Agent Spawning
+
+Agron is an **LLM** at its core, not only an agent system. Its model weights are trained and published in this repository, and the runtime can use the model to power (or seed) specialized **cybersecurity agents** that are spawned in parallel for tasks:
+
+- ExploitAgent
+- AnalysisAgent
+- ReconAgent
+- VulnAgent
+- DefenseAgent
+
+Agents can be created on demand for task decomposition, then run concurrently, while the backbone remains the Agron LLM.
