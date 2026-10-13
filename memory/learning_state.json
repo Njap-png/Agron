@@ -1,7 +1,9 @@
 {
-  "generation": 0,
-  "episodes": 0,
-  "knowledge_entries": 0,
-  "improvements": [],
-  "status": "learning_from_scratch"
+  "generation": 1,
+  "episodes": 1,
+  "knowledge_entries": 8192,
+  "improvements": [
+    "trained 8.4M-parameter Llama from scratch on wikitext-2"
+  ],
+  "status": "trained"
 }

@@ -61,3 +61,9 @@ First cycles prioritize:
 
 Agron can push validated improvements to:
 `https://huggingface.co/teddyoas/Agron`
+
+## Trained LLM
+
+Agron's initial LLM has now been trained **from scratch** on WikiText-2 using a 4-layer, 256-dim, 4-head LLaMA-style architecture (about **8.4M parameters**). Training artifacts and weights are committed in this repository, including `model.safetensors`, tokenizer files, and the checkpoint.
+
+Future recursive self-improvement can fine-tune or grow this base model.
