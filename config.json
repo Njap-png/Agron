@@ -1,0 +1,13 @@
+{
+  "architectures": ["PhantomMultiAgent"],
+  "model_type": "agent_system",
+  "agents": [
+    {"name": "Lyra", "role": "coordinator"},
+    {"name": "Nova", "role": "recon"},
+    {"name": "Orion", "role": "exploit"},
+    {"name": "Vega", "role": "defense"}
+  ],
+  "self_evolution": true,
+  "recursive_learning": true,
+  "license": "MIT"
+}
