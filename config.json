@@ -1,13 +1,19 @@
 {
-  "architectures": ["PhantomMultiAgent"],
+  "model_name": "Agron",
+  "architecture": "AgronMultiAgent",
   "model_type": "agent_system",
+  "learn_from_scratch": true,
+  "recursive_self_improvement": true,
   "agents": [
-    {"name": "Lyra", "role": "coordinator"},
-    {"name": "Nova", "role": "recon"},
-    {"name": "Orion", "role": "exploit"},
-    {"name": "Vega", "role": "defense"}
+    {"name": "Coordinator", "role": "orchestrator"},
+    {"name": "Learner", "role": "knowledge"},
+    {"name": "Builder", "role": "improvement"},
+    {"name": "Guardian", "role": "safety"}
   ],
-  "self_evolution": true,
-  "recursive_learning": true,
+  "bootstrap": {
+    "empty_memory": true,
+    "seed_rules_only": true,
+    "validation_required": true
+  },
   "license": "MIT"
 }

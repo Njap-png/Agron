@@ -7,38 +7,57 @@ tags:
 - multi-agent
 - autonomous
 - self-improving
+- recursive
+- learn-from-scratch
 - huggingface
 pipeline_tag: text-generation
 ---
 
-# Autonomous AI Agent Model
+# Agron — Self-Improving Multi-Agent AI
 
-This repository hosts an **agent-based AI system** powered by a coordinated multi-agent team. It is designed to run autonomous, recursive self-improvement cycles: analyzing tools, generating wrappers, validating changes, learning from missions, and (optionally) publishing improvements.
+**Agron** is an autonomous, self-improving AI agent system that **learns from scratch**.
+It starts with empty memory and bootstrap rules, then recursively improves through:
 
-## Agent Roles
+1. Observation of task outcomes
+2. Memory consolidation and knowledge graph growth
+3. Tool/strategy evolution and validation
+4. Safe self-modification with tests
+5. Optional synchronization to Hugging Face
+
+## Agent Team
 
 | Agent | Role | Specialty |
 |---|---|---|
-| Coordinator (Lyra) | Orchestrator | Task decomposition, delegation, synthesis |
-| Recon (Nova) | Reconnaissance | DNS, OSINT, surface mapping |
-| Exploit (Orion) | Analysis | Vulnerability research, payload analysis |
-| Defense (Vega) | Hardening | SSL, CORS, JWT, monitoring |
+| Coordinator | Orchestrator | Decomposes work, delegates, synthesizes |
+| Learner | Knowledge | Ingests, distills, updates memory from scratch |
+| Builder | Improvement | Generates new tools/strategies recursively |
+| Guardian | Safety | Validates changes, prevents regressions |
 
-## Capabilities
+## Learn From Scratch
 
-- Multi-agent coordination and delegation
-- Recursive self-evolution and XP-based leveling
-- Reconnaissance learning and mission persistence
-- Tool wrapper generation and validation
-- Optional Git/Hugging Face push synchronization
-- Knowledge and technique ingestion from files/URLs
+Agron begins with:
+- Empty episodic memory
+- No imported knowledge
+- Seed evaluation rules only
+- Bootstrap loop enabled
 
-## Usage
+First cycles prioritize:
+- Environment probing
+- Capability discovery
+- Minimal safe tool creation
+- Curriculum expansion
+- Test-backed improvement
 
-```bash
-git clone https://huggingface.co/teddyoas/autonomous-ai-agent-model
-cd autonomous-ai-agent-model
-node phantom.mjs   # if runtime included
-```
+## Recursive Self-Improvement
 
-Model card maintained by @teddyoas.
+- XP / generation tracking
+- Gap analysis against current capabilities
+- Candidate generation with validation
+- Test-gated commits
+- Misalignment/secret checks before push
+- Rollback on failed validation
+
+## Hugging Face Sync
+
+Agron can push validated improvements to:
+`https://huggingface.co/teddyoas/Agron`
