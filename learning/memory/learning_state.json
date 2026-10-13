@@ -1,0 +1,9 @@
+{
+  "generation": 2,
+  "episodes": 2,
+  "knowledge_entries": 16384,
+  "improvements": [
+    "trained ~?M-param LLaMA from scratch on 50k wikitext-103 lines"
+  ],
+  "status": "trained-bigger"
+}

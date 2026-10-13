@@ -1,0 +1,11 @@
+{
+  "mechanisms": [
+    "self_evolve (tests + validation + optimization hints)",
+    "recon_learning extraction after completed missions",
+    "knowledge ingestion via knowledge_add/learn_url/learn_book",
+    "self_add_tool for new capabilities",
+    "install for required security binaries",
+    "git_sync auto-push schedule"
+  ],
+  "status": "enabled"
+}

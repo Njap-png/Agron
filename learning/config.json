@@ -1,0 +1,41 @@
+{
+  "model_name": "Agron",
+  "architecture": "AgronMultiAgent",
+  "model_type": "agent_system",
+  "learn_from_scratch": true,
+  "recursive_self_improvement": true,
+  "agents": [
+    {
+      "name": "ExploitAgent",
+      "role": "exploitation"
+    },
+    {
+      "name": "AnalysisAgent",
+      "role": "analysis"
+    },
+    {
+      "name": "ReconAgent",
+      "role": "surface-mapping"
+    },
+    {
+      "name": "VulnAgent",
+      "role": "vulnerability-research"
+    },
+    {
+      "name": "DefenseAgent",
+      "role": "defense"
+    }
+  ],
+  "bootstrap": {
+    "empty_memory": true,
+    "seed_rules_only": true,
+    "validation_required": true
+  },
+  "license": "MIT",
+  "domain": "cybersecurity-only",
+  "tasks": [
+    "exploitation",
+    "analysis",
+    "parallel-spawn"
+  ]
+}
