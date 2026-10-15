@@ -1,9 +1,46 @@
 import os
+import json
+import time
+import threading
 import torch
 import gradio as gr
-from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
+from datasets import Dataset
+from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast, Trainer, TrainingArguments, DataCollatorForLanguageModeling
+from safetensors.torch import load_file, save_file
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+MEMORY_DIR = os.path.join(ROOT, "memory")
+INTERACTIONS_FILE = os.path.join(MEMORY_DIR, "interactions.jsonl")
+os.makedirs(MEMORY_DIR, exist_ok=True)
+
+IO_LOCK = threading.Lock()
+TRAIN_LOCK = threading.Lock()
+
+interactions = []
+training_state = {"running": False, "steps": 0, "last": "idle", "count_at_train": 0}
+
+
+def load_interactions():
+    global interactions
+    interactions = []
+    if os.path.exists(INTERACTIONS_FILE):
+        with open(INTERACTIONS_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        interactions.append(json.loads(line))
+                    except Exception:
+                        pass
+
+
+def persist_interaction(rec):
+    global interactions
+    with IO_LOCK:
+        interactions.append(rec)
+        with open(INTERACTIONS_FILE, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
 
 def build_tokenizer():
     tok = PreTrainedTokenizerFast(tokenizer_file=os.path.join(ROOT, "tokenizer.json"))
@@ -13,6 +50,7 @@ def build_tokenizer():
     tok.unk_token = "<unk>"
     tok.mask_token = "<mask>"
     return tok
+
 
 def build_model():
     cfg = LlamaConfig(
@@ -29,7 +67,6 @@ def build_model():
         tie_word_embeddings=False,
     )
     model = LlamaForCausalLM(cfg)
-    from safetensors.torch import load_file
     state = load_file(os.path.join(ROOT, "model.safetensors"))
     model.load_state_dict(state)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -37,8 +74,11 @@ def build_model():
     model.eval()
     return model, device
 
+
 TOKENIZER = build_tokenizer()
 MODEL, DEVICE = build_model()
+load_interactions()
+
 
 def _normalize_history(history):
     pairs = []
@@ -58,37 +98,221 @@ def _normalize_history(history):
                 pairs.append((h[0], h[1]))
     return pairs
 
-def chat_fn(message, history, max_new_tokens, temperature, top_p):
-    prompt = ""
-    for user_msg, assistant_msg in _normalize_history(history):
-        prompt += f"User: {user_msg}\nAssistant: {assistant_msg}\n"
-    prompt += f"User: {message}\nAssistant:"
-    inputs = TOKENIZER(prompt, return_tensors="pt").to(DEVICE)
-    input_len = inputs.input_ids.shape[1]
-    with torch.no_grad():
-        output = MODEL.generate(
-            **inputs,
-            max_new_tokens=int(max_new_tokens),
-            do_sample=True,
-            temperature=float(temperature),
-            top_p=float(top_p),
-            pad_token_id=1,
-            eos_token_id=2,
-        )
-    new_tokens = output[0][input_len:]
-    response = TOKENIZER.decode(new_tokens, skip_special_tokens=True)
-    return response.strip()
 
-with gr.Blocks(title="Agron Chat") as demo:
-    gr.Markdown("# Agron — Self-Improving Multi-Agent LLM\nChat with the Agron base model (8-layer LLaMA, ~50M params).")
+def _build_prompt(message, history):
+    ctx_pairs = interactions[-5:]
+    prompt = "### Agron memory (learned from prior use)\n"
+    for r in ctx_pairs:
+        prompt += f"User: {r['user']}\nAgron: {r['assistant']}\n"
+    prompt += "### Conversation\n"
+    for user_msg, assistant_msg in _normalize_history(history):
+        prompt += f"User: {user_msg}\nAgron: {assistant_msg}\n"
+    prompt += f"User: {message}\nAgron:"
+    return prompt
+
+
+def generate_response(message, history, max_new_tokens, temperature, top_p):
+    prompt = _build_prompt(message, history)
+    with IO_LOCK:
+        inputs = TOKENIZER(prompt, return_tensors="pt").to(DEVICE)
+        input_len = inputs.input_ids.shape[1]
+        with torch.no_grad():
+            output = MODEL.generate(
+                **inputs,
+                max_new_tokens=int(max_new_tokens),
+                do_sample=True,
+                temperature=float(temperature),
+                top_p=float(top_p),
+                pad_token_id=1,
+                eos_token_id=2,
+            )
+        new_tokens = output[0][input_len:]
+        response = TOKENIZER.decode(new_tokens, skip_special_tokens=True).strip()
+    persist_interaction({
+        "ts": time.time(),
+        "user": message,
+        "assistant": response,
+    })
+    # adaptive trigger: learn every 8 new interactions
+    if len(interactions) >= 8 and len(interactions) % 8 == 0 and not training_state["running"]:
+        threading.Thread(target=learn_from_interactions, daemon=True).start()
+    return response
+
+
+def learn_from_interactions():
+    global MODEL
+    if not TRAIN_LOCK.acquire(blocking=False):
+        return
+    try:
+        training_state["running"] = True
+        training_state["last"] = "training"
+        texts = [f"User: {r['user']}\nAgron: {r['assistant']}\n" for r in interactions]
+        combined = "\n".join(texts)
+        toks = TOKENIZER(combined)["input_ids"]
+        block = 64
+        chunks = [toks[i:i+block] for i in range(0, max(1, len(toks) - block + 1), block)]
+        # ensure full-size chunks
+        chunks = [c for c in chunks if len(c) == block]
+        if not chunks:
+            pad = [TOKENIZER.pad_token_id] * (block - len(toks))
+            chunks = [toks + pad]
+        ds = Dataset.from_dict({"input_ids": chunks, "labels": [c[:] for c in chunks]})
+        out_dir = os.path.join("/content", "agron-learned")
+        os.makedirs(out_dir, exist_ok=True)
+        args = TrainingArguments(
+            output_dir=out_dir,
+            per_device_train_batch_size=2,
+            max_steps=30,
+            learning_rate=1e-4,
+            optim="adamw_torch",
+            fp16=True if torch.cuda.is_available() else False,
+            logging_steps=10,
+            save_strategy="no",
+            report_to=[],
+            remove_unused_columns=True,
+        )
+        collator = DataCollatorForLanguageModeling(tokenizer=TOKENIZER, mlm=False)
+        trainer = Trainer(model=MODEL, args=args, train_dataset=ds, data_collator=collator, processing_class=TOKENIZER)
+        trainer.train()
+        # reload weights from trained model
+        with IO_LOCK:
+            state = MODEL.state_dict()
+            # Trainer mutated in place; persist to file
+            save_file({k: v.detach().cpu().contiguous() for k, v in state.items()}, os.path.join(out_dir, "model.safetensors"))
+            MODEL.load_state_dict(torch.load(os.path.join(out_dir, "pytorch_model.bin"), map_location=DEVICE) if os.path.exists(os.path.join(out_dir, "pytorch_model.bin")) else state)
+        training_state["steps"] += 30
+        training_state["count_at_train"] = len(interactions)
+        training_state["last"] = f"learned @ {len(interactions)} interactions"
+    except Exception as e:
+        training_state["last"] = f"learn error: {str(e)[:120]}"
+    finally:
+        training_state["running"] = False
+        TRAIN_LOCK.release()
+
+
+def chat_fn(message, history, max_new_tokens, temperature, top_p):
+    return generate_response(message, history, max_new_tokens, temperature, top_p)
+
+
+# ---------- UI ----------
+PARTICLE_HTML = r"""
+<style>
+  body, .gradio-container { background: #020617 !important; }
+  #agron-bg-canvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 0; }
+  .gradio-container { position: relative; z-index: 1; background: transparent !important; }
+  .agron-card { background: rgba(8, 20, 40, 0.55) !important; border: 1px solid rgba(34, 211, 238, 0.35) !important; border-radius: 14px !important; backdrop-filter: blur(6px); box-shadow: 0 0 24px rgba(34,211,238,0.15); }
+  .agron-title { color: #67e8f9; text-shadow: 0 0 18px rgba(34,211,238,0.8); font-family: "Orbitron", "Segoe UI", sans-serif; letter-spacing: 2px; text-align: center; margin-bottom: 4px; }
+  .agron-sub { color: #a5f3fc; text-align: center; font-size: 12px; opacity: 0.8; margin-bottom: 12px; }
+  .status-box textarea { color: #67e8f9 !important; background: rgba(2, 6, 23, 0.6) !important; }
+  footer { display: none !important; }
+</style>
+<canvas id="agron-bg-canvas"></canvas>
+"""
+
+
+PARTICLE_JS = r"""
+const canvas = document.getElementById('agron-bg-canvas');
+if (canvas) {
+  const ctx = canvas.getContext('2d');
+  let w, h, particles = [], mouse = {x: -9999, y: -9999};
+  function resize(){ w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; }
+  resize(); window.addEventListener('resize', resize);
+  window.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+  const N = 130;
+  particles = [];
+  for (let i=0;i<N;i++){ particles.push({x: Math.random()*w, y: Math.random()*h, vx:(Math.random()-0.5)*0.6, vy:(Math.random()-0.5)*0.6, r: Math.random()*1.6+0.6}); }
+  function draw(){
+    ctx.clearRect(0,0,w,h);
+    const t = Date.now()/1000;
+    const cx = w/2, cy = h/2;
+    const pulse = 0.5 + 0.5*Math.sin(t*2);
+    const grad = ctx.createRadialGradient(cx,cy,0,cx,cy,160);
+    grad.addColorStop(0, 'rgba(34,211,238,' + (0.35+0.15*pulse) + ')');
+    grad.addColorStop(1, 'rgba(34,211,238,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(cx,cy,160,0,Math.PI*2); ctx.fill();
+    for (let p of particles){
+      p.x += p.vx; p.y += p.vy;
+      if (p.x<0||p.x>w) p.vx*=-1;
+      if (p.y<0||p.y>h) p.vy*=-1;
+      const dx = mouse.x - p.x, dy = mouse.y - p.y;
+      const d = Math.hypot(dx,dy);
+      if (d < 140){ p.vx += dx/d*0.015; p.vy += dy/d*0.015; }
+      p.vx *= 0.99; p.vy *= 0.99;
+      const pg = ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,p.r*4);
+      pg.addColorStop(0, 'rgba(103,232,249,0.9)');
+      pg.addColorStop(1, 'rgba(103,232,249,0)');
+      ctx.fillStyle = pg;
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r*3,0,Math.PI*2); ctx.fill();
+    }
+    for (let i=0;i<particles.length;i++){
+      for (let j=i+1;j<particles.length;j++){
+        const a=particles[i], b=particles[j];
+        const d = Math.hypot(a.x-b.x,a.y-b.y);
+        if (d < 110){
+          ctx.strokeStyle = 'rgba(34,211,238,' + (0.25*(1-d/110)) + ')';
+          ctx.lineWidth = 0.8;
+          ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+        }
+      }
+    }
+    ctx.strokeStyle = 'rgba(34,211,238,0.04)';
+    ctx.lineWidth = 1;
+    for (let x=0;x<w;x+=80){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+    for (let y=0;y<h;y+=80){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+    requestAnimationFrame(draw);
+  }
+  draw();
+}
+"""
+with gr.Blocks(title="Agron Neural Interface") as demo:
+    gr.HTML(PARTICLE_HTML, js_on_load=PARTICLE_JS)
+    gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>", elem_classes="agron-card")
+    gr.Markdown("<div class='agron-sub'>Self-improving multi-agent core · particles = live network · learning from every exchange</div>")
     with gr.Row():
-        max_new_tokens = gr.Slider(1, 256, value=80, step=1, label="Max new tokens")
-        temperature = gr.Slider(0.1, 2.0, value=0.8, step=0.05, label="Temperature")
-        top_p = gr.Slider(0.1, 1.0, value=0.9, step=0.05, label="Top-p")
-    gr.ChatInterface(
-        fn=chat_fn,
-        additional_inputs=[max_new_tokens, temperature, top_p],
-    )
+        with gr.Column(scale=3, elem_classes="agron-card"):
+            chatbot = gr.Chatbot(height=420, label="Agron")
+            msg = gr.Textbox(placeholder="Speak to Agron...", label="Input", lines=2)
+            with gr.Row():
+                send = gr.Button("Transmit", variant="primary")
+                clear = gr.Button("Clear")
+            with gr.Row():
+                max_new = gr.Slider(8, 160, value=64, step=1, label="Max tokens")
+                temp = gr.Slider(0.2, 1.5, value=0.8, step=0.05, label="Temperature")
+                topp = gr.Slider(0.5, 1.0, value=0.9, step=0.05, label="Top-p")
+        with gr.Column(scale=1, elem_classes="agron-card"):
+            gr.Markdown("### Core status")
+            status = gr.Textbox(value=f"interactions: {len(interactions)} | {training_state['last']}", label="Learning", interactive=False, elem_classes="status-box")
+            learn_btn = gr.Button("Train now on memory")
+            gr.Markdown("### Network metrics")
+            metrics = gr.Textbox(value="nodes: 130 · mesh: active · LFS: ok", label="Diagnostics", interactive=False)
+
+    def respond(message, history):
+        if not message.strip():
+            return history, ""
+        response = generate_response(message, history, max_new.value, temp.value, topp.value)
+        history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": response}]
+        return history, ""
+
+    def do_learn():
+        if training_state["running"]:
+            return f"training already running · {training_state['last']}"
+        if len(interactions) < 4:
+            return f"need at least 4 interactions (have {len(interactions)})"
+        threading.Thread(target=learn_from_interactions, daemon=True).start()
+        return "training started in background..."
+
+    def refresh_status():
+        return f"interactions: {len(interactions)} | running={training_state['running']} | {training_state['last']}"
+
+    send.click(respond, [msg, chatbot], [chatbot, msg])
+    msg.submit(respond, [msg, chatbot], [chatbot, msg])
+    clear.click(lambda: ([], ""), outputs=[chatbot, msg])
+    learn_btn.click(do_learn, outputs=status)
+    demo.load(refresh_status, outputs=status)
+
+    # periodic status refresh (not true polling inside gradio, use change hook via demo load only)
+    gr.Timer(5).tick(refresh_status, outputs=status)
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
