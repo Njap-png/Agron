@@ -803,21 +803,181 @@ def stop_self_evolution():
     return "stopping self-evolution..."
 
 
+
+# ---------- Tools & dashboard ----------
+TOOLS_DIR = os.path.join(MEMORY_DIR, "tools")
+os.makedirs(TOOLS_DIR, exist_ok=True)
+TOOLS_FILE = os.path.join(TOOLS_DIR, "registry.json")
+TOOL_REGISTRY = {}  # name -> {"description":..., "code":..., "builtin": bool}
+
+
+def builtin_web_search(text):
+    res = web_search(text, 5)
+    if not res:
+        return "No results found."
+    return "\n".join(f"{i+1}. {r['title']} - {r.get('snippet','')} ({r['url']})" for i, r in enumerate(res))
+
+
+def builtin_define(text):
+    d = fetch_definition(text.strip())
+    return d if d else f"No definition found for {text}."
+
+
+def builtin_calc(text):
+    try:
+        allowed = {"__builtins__": {}}
+        val = eval(text, allowed, {})
+        return str(val)
+    except Exception as e:
+        return f"calc error: {e}"
+
+
+def builtin_time(text=""):
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def register_builtin_tools():
+    specs = [
+        ("web_search", "Search the web for a query.", None, builtin_web_search),
+        ("define_word", "Define an English word.", None, builtin_define),
+        ("calculate", "Evaluate a math expression.", None, builtin_calc),
+        ("current_time", "Current date/time.", None, builtin_time),
+    ]
+    for name, desc, code, fn in specs:
+        TOOL_REGISTRY[name] = {"description": desc, "code": None, "builtin": True, "fn": fn}
+
+
+def load_tools():
+    if os.path.exists(TOOLS_FILE):
+        try:
+            with open(TOOLS_FILE, "r") as f:
+                data = json.load(f)
+            for t in data:
+                name = t["name"]
+                code = t["code"]
+                g = {}
+                try:
+                    exec(code, g)
+                    TOOL_REGISTRY[name] = {"description": t.get("description", ""), "code": code, "builtin": False, "fn": g.get("run")}
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def save_tools():
+    data = []
+    for name, info in TOOL_REGISTRY.items():
+        if info.get("builtin"):
+            continue
+        data.append({"name": name, "description": info.get("description", ""), "code": info.get("code", "")})
+    with open(TOOLS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def execute_tool(name, text):
+    info = TOOL_REGISTRY.get(name)
+    if not info:
+        return f"Unknown tool: {name}"
+    try:
+        fn = info.get("fn")
+        if fn is None and info.get("code"):
+            g = {}
+            exec(info["code"], g)
+            fn = g.get("run")
+            info["fn"] = fn
+        if fn is None:
+            return "Tool has no runnable function."
+        out = fn(text)
+        return str(out)
+    except Exception as e:
+        return f"tool error: {str(e)[:200]}"
+
+
+def list_tool_names():
+    return sorted(TOOL_REGISTRY.keys())
+
+
+def create_tool_from_description(desc):
+    if not desc.strip():
+        return "Provide a tool description first."
+    try:
+        prompt = (
+            "You are a Python tool generator. Write a Python function named `run(input_text)` that implements this tool: "
+            + desc.strip()
+            + "\nReturn only a single fenced code block with the function. No explanation. The function should return a string. "
+            + "Do not use network or file writes; only pure computation."
+        )
+        msgs = [{"role": "system", "content": "You write safe, pure-Python tool functions as `run(input_text) returning str`."},
+                {"role": "user", "content": prompt}]
+        p = VOICE_TOK.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) if VOICE_TOK else None
+        if VOICE_MODEL is not None and VOICE_TOK is not None:
+            inputs = VOICE_TOK(p, return_tensors="pt").to(VOICE_MODEL.device)
+            with torch.no_grad():
+                out = VOICE_MODEL.generate(**inputs, max_new_tokens=200, do_sample=False)
+            raw = VOICE_TOK.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        else:
+            raw = ""
+        # extract code
+        import re
+        m = re.search(r"```(?:python)?\n(.*?)```", raw, re.S)
+        code = m.group(1).strip() if m else raw.strip()
+        if "def run" not in code:
+            return "Model did not produce a runnable function. Try rephrasing the description."
+        # compile
+        g = {}
+        exec(compile(code, "<tool>", "exec"), g)
+        if not callable(g.get("run")):
+            return "Generated code has no run() function."
+        # quick smoke test
+        try:
+            _ = g["run"]("")
+        except Exception:
+            pass
+        # name
+        slug = "".join(c if c.isalnum() else "_" for c in desc.lower())[:24].strip("_")
+        slug = slug or "tool"
+        name = slug
+        i = 1
+        while name in TOOL_REGISTRY:
+            name = f"{slug}_{i}"
+            i += 1
+        TOOL_REGISTRY[name] = {"description": desc.strip(), "code": code, "builtin": False, "fn": g["run"]}
+        save_tools()
+        return f"Created tool '{name}'. It is now available in the tool panel."
+    except Exception as e:
+        return f"tool creation error: {str(e)[:200]}"
+
+
+register_builtin_tools()
+load_tools()
+
 with gr.Blocks(title="Agron Neural Interface") as demo:
     gr.HTML(PARTICLE_HTML, js_on_load=PARTICLE_JS)
     gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>", elem_classes="agron-card")
     gr.Markdown("<div class='agron-sub'>Self-improving multi-agent core · particles = live network · learning from every exchange</div>")
     with gr.Row():
-        with gr.Column(scale=3, elem_classes="agron-card"):
-            chatbot = gr.Chatbot(height=420, label="Agron")
+        with gr.Column(scale=4, elem_classes="agron-card"):
+            gr.Markdown("<h2 class='agron-title'>💬 COMMAND CONSOLE</h2>")
+            chatbot = gr.Chatbot(height=460, label="Agron")
             msg = gr.Textbox(placeholder="Speak to Agron...", label="Input", lines=2)
             with gr.Row():
                 send = gr.Button("Transmit", variant="primary")
                 clear = gr.Button("Clear")
-            gr.Markdown("⚙ decoding: auto (max 96 tokens · adaptive temp 0.8 · top-p 0.9)")
-        with gr.Column(scale=1, elem_classes="agron-card"):
-            gr.Markdown("### Core status")
+            gr.Markdown("⚙ auto decoding · high cap · focused")
+        with gr.Column(scale=2, elem_classes="agron-card"):
+            gr.Markdown("<h2 class='agron-title'>📊 SYSTEM DASHBOARD</h2>")
             status = gr.Textbox(value=f"interactions: {len(interactions)} | {training_state['last']}", label="Learning", interactive=False, elem_classes="status-box")
+            metrics = gr.Textbox(value=f"tools: {len(list_tool_names())} · cycles: {EVOLVE_STATE['cycles']} · nodes: 130", label="Diagnostics", interactive=False)
+            gr.Markdown("### Tools")
+            tool_dd = gr.Dropdown(choices=list_tool_names(), value=(list_tool_names()[0] if list_tool_names() else None), label="Select tool")
+            tool_in = gr.Textbox(placeholder="Tool input...", label="Tool input", lines=1)
+            tool_btn = gr.Button("Run tool")
+            tool_out = gr.Textbox(label="Tool output", interactive=False, lines=6)
+            gr.Markdown("### Create tool")
+            tool_desc = gr.Textbox(placeholder="Describe a new tool (pure computation)...", label="New tool description", lines=2)
+            create_btn = gr.Button("Create tool")
+            gr.Markdown("### Learning controls")
             learn_btn = gr.Button("Train now on memory")
             dict_btn = gr.Button("Learn dictionary words")
             web_topic = gr.Textbox(label="Web topic / search query", placeholder="e.g. transformer architecture", lines=1)
@@ -826,8 +986,6 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
                 evolve_btn = gr.Button("Start self-evolution")
                 stop_evolve_btn = gr.Button("Stop")
             update_btn = gr.Button("Self-update")
-            gr.Markdown("### Network metrics")
-            metrics = gr.Textbox(value="nodes: 130 · mesh: active · LFS: ok", label="Diagnostics", interactive=False)
 
     def respond(message, history):
         if not message.strip():
@@ -864,6 +1022,17 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
             return "enter a topic/query first"
         threading.Thread(target=learn_web, args=(q,), daemon=True).start()
         return f"web learning started: {q}"
+    def run_tool_fn(tool_name, tool_input):
+        if not tool_name:
+            return "select a tool first"
+        return execute_tool(tool_name, tool_input or "")
+    def create_tool_fn(desc):
+        return create_tool_from_description(desc)
+    def refresh_tools():
+        choices = list_tool_names()
+        return gr.Dropdown(choices=choices, value=(choices[0] if choices else None))
+    tool_btn.click(run_tool_fn, [tool_dd, tool_in], tool_out)
+    create_btn.click(create_tool_fn, tool_desc, status)
     learn_btn.click(do_learn, outputs=status)
     dict_btn.click(do_dict, outputs=status)
     web_btn.click(do_web, outputs=status)
