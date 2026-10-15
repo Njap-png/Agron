@@ -987,6 +987,16 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
                 stop_evolve_btn = gr.Button("Stop")
             update_btn = gr.Button("Self-update")
 
+    # Embedded sci-fi dashboard (served via data URL)
+    try:
+        import base64 as _b64
+        _dash_html = open(os.path.join(ROOT, "agron_dashboard.html")).read()
+        _dash_b64 = _b64.b64encode(_dash_html.encode()).decode()
+        with gr.Accordion("AGRØN Dashboard HUD", open=True):
+            gr.HTML(f'<iframe src="data:text/html;base64,{_dash_b64}" style="width:100%;height:80vh;border:0;border-radius:12px;" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>')
+    except Exception as e:
+        gr.Markdown(f"Dashboard not available: {e}")
+
     def respond(message, history):
         if not message.strip():
             return history, ""
