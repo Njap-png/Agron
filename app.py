@@ -1,8 +1,10 @@
 import os
 import json
 import time
+import random
 import threading
 import subprocess
+import urllib.request
 import torch
 import gradio as gr
 from datasets import Dataset
@@ -284,6 +286,112 @@ if (canvas) {
   draw();
 }
 """
+WORDLIST_URL = "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt"
+
+
+def fetch_word_list(limit=500):
+    try:
+        with urllib.request.urlopen(WORDLIST_URL, timeout=45) as r:
+            raw = r.read().decode("utf-8", "ignore")
+        cand = []
+        seen = set()
+        for w in raw.splitlines():
+            w = w.strip().lower()
+            if 3 <= len(w) <= 10 and w.isalpha() and w not in seen:
+                seen.add(w)
+                cand.append(w)
+            if len(cand) >= limit * 3:
+                break
+        random.shuffle(cand)
+        return cand[:limit]
+    except Exception as e:
+        training_state["last"] = f"wordlist error: {str(e)[:100]}"
+        return []
+
+
+def fetch_definition(word):
+    try:
+        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
+        with urllib.request.urlopen(url, timeout=20) as r:
+            data = json.loads(r.read().decode())
+        meanings = data[0].get("meanings", [])
+        for m in meanings:
+            for d in m.get("definitions", []):
+                if d.get("definition"):
+                    ex = d.get("example")
+                    txt = f"{word}: {d['definition']}"
+                    if ex:
+                        txt += f" Example: {ex}"
+                    return txt
+    except Exception:
+        return None
+    return None
+
+
+def learn_dictionary():
+    global MODEL
+    if not TRAIN_LOCK.acquire(blocking=False):
+        return
+    training_state["running"] = True
+    training_state["last"] = "fetching dictionary..."
+    try:
+        words = fetch_word_list(400)
+        if not words:
+            raise RuntimeError("could not fetch word list")
+        lines = []
+        for i, w in enumerate(words):
+            training_state["last"] = f"dictionary {i+1}/{len(words)}: {w}"
+            d = fetch_definition(w)
+            if d:
+                lines.append(d)
+            time.sleep(0.08)
+        if len(lines) < 20:
+            raise RuntimeError(f"too few definitions fetched ({len(lines)})")
+        corpus = "\n".join(lines)
+        toks = TOKENIZER(corpus)["input_ids"]
+        block = 64
+        chunks = [toks[i:i+block] for i in range(0, max(1, len(toks) - block + 1), block)]
+        chunks = [c for c in chunks if len(c) == block]
+        if not chunks:
+            chunks = [toks[:block] + [TOKENIZER.pad_token_id] * (block - min(block, len(toks)))]
+        ds = Dataset.from_dict({"input_ids": chunks, "labels": [c[:] for c in chunks]})
+        out_dir = os.path.join("/content", "agron-dictionary")
+        os.makedirs(out_dir, exist_ok=True)
+        args = TrainingArguments(
+            output_dir=out_dir,
+            per_device_train_batch_size=2,
+            max_steps=80,
+            learning_rate=1e-4,
+            optim="adamw_torch",
+            fp16=True if torch.cuda.is_available() else False,
+            logging_steps=20,
+            save_strategy="no",
+            report_to=[],
+            remove_unused_columns=True,
+        )
+        collator = DataCollatorForLanguageModeling(tokenizer=TOKENIZER, mlm=False)
+        trainer = Trainer(model=MODEL, args=args, train_dataset=ds, data_collator=collator, processing_class=TOKENIZER)
+        training_state["last"] = f"training on {len(lines)} definitions..."
+        trainer.train()
+        save_file({k: v.detach().cpu().contiguous() for k, v in MODEL.state_dict().items()}, os.path.join(out_dir, "model.safetensors"))
+        import shutil
+        shutil.copyfile(os.path.join(out_dir, "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
+        # push
+        training_state["last"] = "pushing dictionary model..."
+        subprocess.run(["git", "-C", ROOT, "add", "model.safetensors"], check=True)
+        subprocess.run(["git", "-C", ROOT, "add", "memory/interactions.jsonl"], check=False)
+        status = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
+        if status:
+            subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron dictionary learning ({len(lines)} words)"], check=True)
+            subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+        training_state["last"] = f"dictionary learned & pushed ({len(lines)} words)"
+    except Exception as e:
+        training_state["last"] = f"dict error: {str(e)[:150]}"
+    finally:
+        training_state["running"] = False
+        TRAIN_LOCK.release()
+
+
 with gr.Blocks(title="Agron Neural Interface") as demo:
     gr.HTML(PARTICLE_HTML, js_on_load=PARTICLE_JS)
     gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>", elem_classes="agron-card")
@@ -300,6 +408,7 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
             gr.Markdown("### Core status")
             status = gr.Textbox(value=f"interactions: {len(interactions)} | {training_state['last']}", label="Learning", interactive=False, elem_classes="status-box")
             learn_btn = gr.Button("Train now on memory")
+            dict_btn = gr.Button("Learn dictionary words")
             gr.Markdown("### Network metrics")
             metrics = gr.Textbox(value="nodes: 130 · mesh: active · LFS: ok", label="Diagnostics", interactive=False)
 
@@ -324,7 +433,13 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
     send.click(respond, [msg, chatbot], [chatbot, msg])
     msg.submit(respond, [msg, chatbot], [chatbot, msg])
     clear.click(lambda: ([], ""), outputs=[chatbot, msg])
+    def do_dict():
+        if training_state["running"]:
+            return "training already running"
+        threading.Thread(target=learn_dictionary, daemon=True).start()
+        return "dictionary learning started in background..."
     learn_btn.click(do_learn, outputs=status)
+    dict_btn.click(do_dict, outputs=status)
     demo.load(refresh_status, outputs=status)
 
     # periodic status refresh (not true polling inside gradio, use change hook via demo load only)
