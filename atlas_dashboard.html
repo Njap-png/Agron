@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ATLAS — Neural Command Dashboard</title>
+<style>
+  :root {
+    --bg: #020617;
+    --panel: rgba(8, 20, 45, 0.55);
+    --border: rgba(34, 211, 238, 0.35);
+    --cyan: #22d3ee;
+    --amber: #fbbf24;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --red: #f87171;
+    --green: #34d399;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body {
+    background: radial-gradient(1200px 800px at 50% 40%, #0a1a3a 0%, #020617 70%);
+    color: var(--text);
+    font-family: "Segoe UI", "Orbitron", monospace;
+  }
+  .app { display: flex; flex-direction: column; height: 100vh; padding: 10px 14px; gap: 10px; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 14px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    backdrop-filter: blur(6px);
+    box-shadow: 0 0 24px rgba(34,211,238,0.15);
+  }
+  .title { display: flex; align-items: center; gap: 12px; }
+  .title h1 {
+    margin: 0; font-size: 28px; letter-spacing: 4px;
+    color: var(--cyan); text-shadow: 0 0 18px rgba(34,211,238,0.85);
+  }
+  .title .sub { font-size: 11px; color: var(--muted); letter-spacing: 1px; }
+  .tag { padding: 4px 10px; border: 1px solid var(--amber); color: var(--amber); border-radius: 999px; font-size: 11px; }
+  .header-right { display: flex; align-items: center; gap: 14px; font-size: 12px; }
+  .clock { font-family: monospace; color: var(--cyan); text-shadow: 0 0 8px rgba(34,211,238,0.6); font-size: 18px; }
+  .voice-btn {
+    padding: 6px 12px; border: 1px solid var(--cyan); background: transparent; color: var(--cyan);
+    border-radius: 8px; cursor: pointer; font-size: 11px; letter-spacing: 1px;
+  }
+  .voice-btn.on { background: rgba(34,211,238,0.18); }
+  .grid { display: grid; grid-template-columns: 22% 56% 22%; gap: 10px; flex: 1; min-height: 0; }
+  .col { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px; backdrop-filter: blur(6px); box-shadow: 0 0 18px rgba(34,211,238,0.12);
+    display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+  }
+  .panel h3 { margin: 0 0 8px; font-size: 12px; letter-spacing: 3px; color: var(--cyan); text-shadow: 0 0 8px rgba(34,211,238,0.5); }
+  /* Reactor */
+  .reactor-wrap { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .reactor-svg { width: 150px; height: 150px; }
+  .ring { fill: none; transform-origin: center; }
+  .ring.cyan { stroke: var(--cyan); stroke-dasharray: 6 6; }
+  .ring.amber { stroke: var(--amber); stroke-dasharray: 4 8; }
+  .core { fill: var(--cyan); filter: drop-shadow(0 0 8px var(--cyan)); }
+  .status-label { font-size: 13px; letter-spacing: 3px; color: var(--green); text-align: center; font-weight: 700; }
+  /* gauges */
+  .gauges { display: flex; justify-content: space-around; gap: 6px; }
+  .gauge { text-align: center; }
+  .gauge svg { width: 78px; height: 78px; }
+  .gauge .val { font-family: monospace; font-size: 13px; color: var(--cyan); }
+  .gauge .lbl { font-size: 10px; color: var(--muted); letter-spacing: 1px; }
+  /* stats */
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 11px; }
+  .stat { background: rgba(0,0,0,0.25); border: 1px solid rgba(34,211,238,0.18); border-radius: 6px; padding: 6px; }
+  .stat .k { color: var(--muted); font-size: 10px; letter-spacing: 1px; }
+  .stat .v { color: var(--cyan); font-family: monospace; font-size: 13px; }
+  .spark { height: 44px; border: 1px solid rgba(34,211,238,0.2); border-radius: 6px; }
+  /* center */
+  .center-panel { position: relative; }
+  #neural { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 0; }
+  .chat-wrap { position: absolute; left: 0; right: 0; bottom: 0; height: 42%; z-index: 1; padding: 10px; display: flex; flex-direction: column; }
+  .chat-fade { position: absolute; top: -40px; left: 0; right: 0; height: 40px; background: linear-gradient(to top, var(--panel), transparent); pointer-events: none; }
+  .chat {
+    flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;
+    background: linear-gradient(to top, rgba(2,6,23,0.85), rgba(2,6,23,0.4));
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px; backdrop-filter: blur(4px);
+  }
+  .msg { max-width: 86%; padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.45; }
+  .msg.user { align-self: flex-end; background: rgba(251,191,36,0.12); border: 1px solid rgba(251,191,36,0.4); color: #fde68a; border-radius: 10px 2px 10px 10px; }
+  .msg.atlas { align-self: flex-start; background: rgba(34,211,238,0.08); border-left: 3px solid var(--cyan); }
+  .msg .meta { font-size: 10px; color: var(--muted); margin-top: 4px; font-family: monospace; }
+  .cursor { display: inline-block; width: 7px; background: var(--cyan); margin-left: 2px; animation: blink 0.9s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .chip { padding: 4px 10px; border: 1px solid rgba(34,211,238,0.3); border-radius: 999px; font-size: 11px; color: var(--cyan); cursor: pointer; background: rgba(34,211,238,0.06); }
+  .chip:hover { background: rgba(34,211,238,0.18); }
+  .input-row { display: flex; gap: 6px; }
+  textarea { flex: 1; background: rgba(0,0,0,0.3); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px; font-size: 13px; resize: none; height: 46px; }
+  .send { padding: 0 14px; border: 1px solid var(--cyan); background: rgba(34,211,238,0.12); color: var(--cyan); border-radius: 8px; cursor: pointer; }
+  .clear { padding: 0 10px; border: 1px solid var(--muted); color: var(--muted); border-radius: 8px; cursor: pointer; background: transparent; }
+  /* right event log */
+  .filters { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+  .filter-btn { padding: 3px 9px; border: 1px solid var(--border); border-radius: 6px; font-size: 10px; cursor: pointer; color: var(--muted); background: transparent; }
+  .filter-btn.active { color: var(--cyan); border-color: var(--cyan); }
+  .log { flex: 1; overflow-y: auto; font-family: monospace; font-size: 11px; padding: 6px; background: rgba(0,0,0,0.3); border-radius: 6px; }
+  .log .line { padding: 2px 0; border-bottom: 1px solid rgba(34,211,238,0.06); white-space: pre-wrap; }
+  .log .ts { color: #64748b; }
+  .log .INFO { color: var(--cyan); }
+  .log .WARN { color: var(--amber); }
+  .log .ERROR { color: var(--red); }
+  .log .DEBUG { color: #a78bfa; }
+  .pause-row { display: flex; gap: 6px; margin-bottom: 6px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } body { overflow: auto; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="title">
+      <h1>ATLAS</h1>
+      <div class="sub">AUTONOMOUS TACTICAL LANGUAGE &amp; ANALYSIS SYSTEM</div>
+    </div>
+    <div class="tag">atlas-7b-instruct · q4_k_m · 8k ctx</div>
+    <div class="header-right">
+      <div class="clock" id="clock">00:00:00</div>
+      <button class="voice-btn" id="voiceBtn">VOICE OFF</button>
+    </div>
+  </header>
+  <div class="grid">
+    <div class="col">
+      <div class="panel">
+        <h3>REACTOR</h3>
+        <div class="reactor-wrap">
+          <svg class="reactor-svg" viewBox="0 0 200 200">
+            <circle cx="100" cy="100" r="88" class="ring cyan" id="ring1"/>
+            <circle cx="100" cy="100" r="70" class="ring amber" id="ring2"/>
+            <circle cx="100" cy="100" r="50" class="ring cyan" id="ring3"/>
+            <circle cx="100" cy="100" r="12" class="core" id="core"/>
+          </svg>
+          <div class="status-label" id="statusLabel">ONLINE</div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>GAUGES</h3>
+        <div class="gauges">
+          <div class="gauge">
+            <svg viewBox="0 0 80 80">
+              <circle cx="40" cy="40" r="32" stroke="#0f172a" stroke-width="8" fill="none"/>
+              <circle cx="40" cy="40" r="32" stroke="#22d3ee" stroke-width="8" fill="none" stroke-linecap="round" id="gpuRing" stroke-dasharray="0 201"/>
+            </svg>
+            <div class="val" id="gpuVal">0%</div>
+            <div class="lbl">GPU</div>
+          </div>
+          <div class="gauge">
+            <svg viewBox="0 0 80 80">
+              <circle cx="40" cy="40" r="32" stroke="#0f172a" stroke-width="8" fill="none"/>
+              <circle cx="40" cy="40" r="32" stroke="#fbbf24" stroke-width="8" fill="none" stroke-linecap="round" id="vramRing" stroke-dasharray="0 201"/>
+            </svg>
+            <div class="val" id="vramVal">0/16 GB</div>
+            <div class="lbl">VRAM</div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>TOKENS / SEC</h3>
+        <canvas class="spark" id="spark" width="260" height="44"></canvas>
+        <div class="stats" style="margin-top:6px;">
+          <div class="stat"><div class="k">TOK/S</div><div class="v" id="toks">0.0</div></div>
+          <div class="stat"><div class="k">TTFT</div><div class="v" id="ttft">0 ms</div></div>
+          <div class="stat"><div class="k">REQS</div><div class="v" id="reqs">0</div></div>
+          <div class="stat"><div class="k">TOKENS OUT</div><div class="v" id="tokOut">0</div></div>
+          <div class="stat"><div class="k">QUEUE</div><div class="v" id="queue">0</div></div>
+          <div class="stat"><div class="k">ERRORS</div><div class="v" id="errs">0</div></div>
+          <div class="stat"><div class="k">GPU TEMP</div><div class="v" id="gputemp">0°C</div></div>
+          <div class="stat"><div class="k">STATUS</div><div class="v" id="conn">READY</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="panel center-panel" style="flex:1;">
+        <canvas id="neural"></canvas>
+        <div class="chat-wrap">
+          <div class="chat-fade"></div>
+          <div class="chips" id="chips"></div>
+          <div class="chat" id="chat"></div>
+          <div class="input-row" style="margin-top:6px;">
+            <button class="clear" id="clearBtn">Clear</button>
+            <textarea id="input" placeholder="Speak to ATLAS… (Enter to send, Shift+Enter newline)"></textarea>
+            <button class="send" id="sendBtn">Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="panel" style="flex:1;">
+        <h3>EVENT LOG</h3>
+        <div class="filters" id="filters"></div>
+        <div class="pause-row">
+          <button class="filter-btn" id="pauseBtn">Pause</button>
+        </div>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ---------- state ----------
+  const state = {
+    status: 'ONLINE', // ONLINE, ANALYZING, RESPONDING
+    gpu: 12, vram: 6.8, toks: 0, ttft: 0, reqs: 0, tokOut: 0, queue: 0, errs: 0, gputemp: 54,
+    voice: false, spin: 1, pulse: 1,
+    pausedLog: false,
+    chatBusy: false,
+  };
+  const filters = { INFO: true, WARN: true, ERROR: true, DEBUG: true };
+
+  // ---------- uptime clock ----------
+  const start = Date.now();
+  function fmtTime(ms){ const s=Math.floor(ms/1000); const h=Math.floor(s/3600).toString().padStart(2,'0'); const m=Math.floor((s%3600)/60).toString().padStart(2,'0'); const sec=(s%60).toString().padStart(2,'0'); return `${h}:${m}:${sec}`; }
+  setInterval(() => { document.getElementById('clock').textContent = fmtTime(Date.now()-start); }, 1000);
+
+  // ---------- voice toggle ----------
+  const voiceBtn = document.getElementById('voiceBtn');
+  voiceBtn.addEventListener('click', () => {
+    state.voice = !state.voice;
+    voiceBtn.textContent = state.voice ? 'VOICE ON' : 'VOICE OFF';
+    voiceBtn.classList.toggle('on', state.voice);
+    logEvent('INFO', `Voice ${state.voice ? 'enabled' : 'disabled'}`);
+  });
+  function speak(text){
+    if(!state.voice) return;
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      u.pitch = 0.8; u.rate = 0.95; u.volume = 1;
+      speechSynthesis.speak(u);
+    } catch(e){}
+  }
+
+  // ---------- event log ----------
+  const logEl = document.getElementById('log');
+  let userAtBottom = true;
+  logEl.addEventListener('scroll', () => { userAtBottom = (logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8); });
+  const logEntries = [];
+  function logEvent(level, msg){
+    const now = new Date();
+    const ts = now.toTimeString().slice(0,8)+'.'+String(now.getMilliseconds()).padStart(3,'0');
+    logEntries.push({ts, level, msg});
+    renderLog();
+  }
+  function renderLog(){
+    logEl.innerHTML = '';
+    for(const e of logEntries){
+      if(!filters[e.level]) continue;
+      const div = document.createElement('div');
+      div.className = 'line';
+      div.innerHTML = `<span class="ts">[${e.ts}]</span> <span class="${e.level}">${e.level}</span> ${escapeHtml(e.msg)}`;
+      logEl.appendChild(div);
+    }
+    if(!state.pausedLog && userAtBottom){ logEl.scrollTop = logEl.scrollHeight; }
+  }
+  function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  // filters
+  const filterWrap = document.getElementById('filters');
+  Object.keys(filters).forEach(lv=>{
+    const b = document.createElement('button');
+    b.className = 'filter-btn active';
+    b.textContent = lv;
+    b.addEventListener('click', ()=>{ filters[lv]=!filters[lv]; b.classList.toggle('active', filters[lv]); renderLog(); });
+    filterWrap.appendChild(b);
+  });
+  const pauseBtn = document.getElementById('pauseBtn');
+  pauseBtn.addEventListener('click', ()=>{ state.pausedLog = !state.pausedLog; pauseBtn.textContent = state.pausedLog ? 'Resume' : 'Pause'; });
+
+  // boot sequence
+  const bootSeq = [
+    'INFO: ATLAS boot sequence initialized',
+    'DEBUG: loading neural weights (q4_k_m)',
+    'INFO: GPU context created (simulated)',
+    'INFO: vector store ready',
+    'INFO: comms channel established',
+    'DEBUG: heartbeat monitor armed',
+  ];
+  let bi = 0;
+  const bootTimer = setInterval(() => {
+    if(bi >= bootSeq.length){ clearInterval(bootTimer); logEvent('INFO','ATLAS online and ready.'); return; }
+    const parts = bootSeq[bi].split(':');
+    logEvent(parts[0], parts.slice(1).join(':').trim());
+    bi++;
+  }, 600);
+
+  // heartbeat
+  setInterval(() => {
+    logEvent('DEBUG', `health check ok · gpu ${state.gpu}% · queue ${state.queue}`);
+  }, 4500);
+
+  // ---------- neural network canvas ----------
+  const canvas = document.getElementById('neural');
+  const ctx = canvas.getContext('2d');
+  let W, H;
+  function resizeCanvas(){ W = canvas.width = canvas.clientWidth; H = canvas.height = canvas.clientHeight; }
+  window.addEventListener('resize', resizeCanvas); resizeCanvas();
+  let mx = 0, my = 0;
+  canvas.addEventListener('mousemove', e => { const r=canvas.getBoundingClientRect(); mx=(e.clientX-r.left-W/2)/W; my=(e.clientY-r.top-H/2)/H; });
+
+  const N = 120;
+  const nodes = [];
+  for(let i=0;i<N;i++){
+    const r = 60 + Math.random()*240;
+    const inc = Math.random()*Math.PI;
+    const plane = Math.random()*Math.PI*2;
+    const speed = (0.25+Math.random()*0.6)*(Math.random()<0.5?-1:1);
+    const col = Math.random()<0.15 ? '#fbbf24' : '#22d3ee';
+    nodes.push({ id:i, r, inc, plane, speed, angle: Math.random()*Math.PI*2, trail:[], color:col, size: 1+Math.random()*1.5, pulse: Math.random()*Math.PI*2 });
+  }
+  // query arrows
+  let queries = [];
+  function spawnQueries(){
+    const k = 3 + Math.floor(Math.random()*3);
+    queries = [];
+    for(let i=0;i<k;i++){
+      queries.push({ t:0, speed: 0.4+Math.random()*0.4, node: Math.floor(Math.random()*N), trail:[] });
+    }
+  }
+  // rotate cloud yaw
+  let yaw = 0;
+  const projections = [];
+  function stepNodes(dt){
+    const workMul = state.status==='RESPONDING' ? 2.2 : state.status==='ANALYZING' ? 1.5 : 1;
+    yaw += 0.25*dt*workMul;
+    for(const n of nodes){
+      n.angle += n.speed*dt*workMul;
+      n.pulse += 2*dt*workMul;
+      const c = Math.cos(n.angle), s = Math.sin(n.angle);
+      let x = n.r*c, y = n.r*s, z = 0;
+      // inclination
+      const ci = Math.cos(n.inc), si = Math.sin(n.inc);
+      const y1 = y*ci - z*si; const z1 = y*si + z*ci; const x1 = x;
+      // plane rotation
+      const cp = Math.cos(n.plane), sp = Math.sin(n.plane);
+      const x2 = x1*cp + z1*sp; const z2 = -x1*sp + z1*cp; const y2 = y1;
+      // global yaw + mouse parallax
+      const yawTot = yaw + mx*0.6;
+      const pitch = my*0.4;
+      let X = x2*Math.cos(yawTot) - z2*Math.sin(yawTot);
+      let Z = x2*Math.sin(yawTot) + z2*Math.cos(yawTot);
+      let Y = y2*Math.cos(pitch) - Z*Math.sin(pitch);
+      let Zp = y2*Math.sin(pitch) + Z*Math.cos(pitch);
+      const scale = 380/(380+Zp);
+      const sx = W/2 + X*scale;
+      const sy = H/2 + Y*scale;
+      n.trail.push({x:sx,y:sy});
+      if(n.trail.length>9) n.trail.shift();
+      n.proj = {x:sx,y:sy,scale,z:Zp};
+    }
+    // queries
+    if(state.chatBusy){ if(queries.length===0) spawnQueries(); }
+    else { queries = []; }
+    for(const q of queries){
+      q.t = Math.min(1, q.t + q.speed*dt);
+      const target = nodes[q.node].proj;
+      const sx = W/2 + (target.x-W/2)*q.t*0.9;
+      const sy = H/2 + (target.y-H/2)*q.t*0.9 - 10;
+      q.pos = {x:sx,y:sy};
+      q.trail.push({x:sx,y:sy}); if(q.trail.length>12) q.trail.shift();
+    }
+  }
+  function drawNetwork(){
+    ctx.clearRect(0,0,W,H);
+    // connections
+    for(let i=0;i<N;i++){
+      for(let j=i+1;j<N;j++){
+        const a=nodes[i].proj, b=nodes[j].proj;
+        const d = Math.hypot(a.x-b.x, a.y-b.y);
+        if(d < 150){
+          const alpha = (1 - d/150)*0.35;
+          ctx.strokeStyle = `rgba(34,211,238,${alpha})`;
+          ctx.lineWidth = 0.6;
+          ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+        }
+      }
+    }
+    // nodes
+    for(const n of nodes){
+      const p = n.proj;
+      const flicker = 0.7+0.3*Math.sin(n.pulse);
+      // trail
+      for(let t=0;t<n.trail.length-1;t++){
+        ctx.strokeStyle = n.color === '#fbbf24' ? `rgba(251,191,36,${ (t/n.trail.length)*0.4 })` : `rgba(34,211,238,${ (t/n.trail.length)*0.4 })`;
+        ctx.lineWidth = 0.8;
+        ctx.beginPath(); ctx.moveTo(n.trail[t].x, n.trail[t].y); ctx.lineTo(n.trail[t+1].x, n.trail[t+1].y); ctx.stroke();
+      }
+      const glow = ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,8);
+      glow.addColorStop(0, (n.color==='#fbbf24'?'rgba(251,191,36,0.9)':'rgba(103,232,249,0.9)'));
+      glow.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(p.x,p.y,8,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle = n.color; ctx.beginPath(); ctx.arc(p.x,p.y,n.size,0,Math.PI*2); ctx.fill();
+    }
+    // query arrows
+    for(const q of queries){
+      const p = q.pos;
+      // arrow body
+      ctx.strokeStyle = 'rgba(251,191,36,0.9)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(W/2, H/2);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+      // arrowhead
+      const ang = Math.atan2(p.y-H/2, p.x-W/2);
+      ctx.fillStyle = 'rgba(251,191,36,0.9)';
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x-8*Math.cos(ang-0.35), p.y-8*Math.sin(ang-0.35));
+      ctx.lineTo(p.x-8*Math.cos(ang+0.35), p.y-8*Math.sin(ang+0.35));
+      ctx.closePath(); ctx.fill();
+      // trail
+      for(let t=0;t<q.trail.length-1;t++){
+        ctx.strokeStyle = `rgba(251,191,36,${(t/q.trail.length)*0.4})`;
+        ctx.lineWidth=1.2;
+        ctx.beginPath(); ctx.moveTo(q.trail[t].x,q.trail[t].y); ctx.lineTo(q.trail[t+1].x,q.trail[t+1].y); ctx.stroke();
+      }
+    }
+    // core
+    const pulse = 0.5+0.5*Math.sin(Date.now()/300);
+    const cg = ctx.createRadialGradient(W/2,H/2,0,W/2,H/2,24);
+    cg.addColorStop(0, `rgba(34,211,238,${0.6+0.3*pulse})`);
+    cg.addColorStop(1, 'rgba(34,211,238,0)');
+    ctx.fillStyle=cg; ctx.beginPath(); ctx.arc(W/2,H/2,24,0,Math.PI*2); ctx.fill();
+  }
+  let last = performance.now();
+  function loop(now){
+    const dt = Math.min(0.05, (now-last)/1000); last=now;
+    stepNodes(dt);
+    drawNetwork();
+    // reactor rotation
+    const mul = state.status==='RESPONDING'?2.2:state.status==='ANALYZING'?1.5:1;
+    document.getElementById('ring1').style.transform = `rotate(${(Date.now()/1000*40*mul)%360}deg)`;
+    document.getElementById('ring2').style.transform = `rotate(${-(Date.now()/1000*30*mul)%360}deg)`;
+    document.getElementById('ring3').style.transform = `rotate(${(Date.now()/1000*50*mul)%360}deg)`;
+    const core = document.getElementById('core');
+    const cr = 10 + 4*pulseMul(mul);
+    core.setAttribute('r', cr);
+    requestAnimationFrame(loop);
+  }
+  function pulseMul(m){ return 0.5+0.5*Math.sin(Date.now()/(300/m)); }
+  requestAnimationFrame(loop);
+
+  // ---------- gauges update ----------
+  const C = 2*Math.PI*32;
+  function setGauge(idVal, idRing, v, max, suffix){
+    document.getElementById(idVal).textContent = suffix ? `${v.toFixed(1)}${suffix}` : v.toFixed(0)+'%';
+    document.getElementById(idRing).setAttribute('stroke-dasharray', `${(v/max)*C} ${C}`);
+  }
+  // sparkline
+  const spark = document.getElementById('spark');
+  const sctx = spark.getContext('2d');
+  const sparkData = new Array(60).fill(0);
+  function drawSpark(){
+    sctx.clearRect(0,0,spark.width,spark.height);
+    sctx.strokeStyle = 'rgba(34,211,238,0.7)';
+    sctx.lineWidth = 1.5;
+    sctx.beginPath();
+    for(let i=0;i<sparkData.length;i++){
+      const x = i/(sparkData.length-1)*spark.width;
+      const y = spark.height - (sparkData[i]/60)*spark.height;
+      if(i===0) sctx.moveTo(x,y); else sctx.lineTo(x,y);
+    }
+    sctx.stroke();
+  }
+  drawSpark();
+
+  // ---------- simulated metrics ----------
+  setInterval(() => {
+    if(state.status==='RESPONDING'){
+      state.gpu = clamp(state.gpu + (Math.random()-0.45)*6, 40, 96);
+      state.vram = clamp(state.vram + (Math.random()-0.5)*0.4, 6, 14.5);
+      state.toks = 28 + Math.random()*18;
+      state.gputemp = 62 + Math.random()*8;
+    } else if(state.status==='ANALYZING'){
+      state.gpu = clamp(state.gpu + (Math.random()-0.5)*4, 20, 70);
+      state.toks = 4 + Math.random()*6;
+      state.gputemp = 50 + Math.random()*6;
+    } else {
+      state.gpu = clamp(state.gpu + (Math.random()-0.5)*3, 8, 35);
+      state.vram = clamp(state.vram + (Math.random()-0.5)*0.1, 6, 7.5);
+      state.toks = Math.max(0, state.toks*0.85);
+      state.gputemp = 42 + Math.random()*4;
+    }
+    setGauge('gpuVal','gpuRing',state.gpu,100,'');
+    setGauge('vramVal','vramRing',state.vram,16,'');
+    document.getElementById('toks').textContent = state.toks.toFixed(1);
+    document.getElementById('gputemp').textContent = state.gputemp.toFixed(0)+'°C';
+    document.getElementById('queue').textContent = state.queue;
+    document.getElementById('errs').textContent = state.errs;
+    document.getElementById('reqs').textContent = state.reqs;
+    document.getElementById('tokOut').textContent = state.tokOut;
+    document.getElementById('conn').textContent = state.status;
+    document.getElementById('statusLabel').textContent = state.status;
+    document.getElementById('statusLabel').style.color = state.status==='RESPONDING'?'#22d3ee':state.status==='ANALYZING'?'#fbbf24':'#34d399';
+    sparkData.shift(); sparkData.push(state.toks); drawSpark();
+  }, 700);
+  function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+
+  // ---------- chat ----------
+  const chat = document.getElementById('chat');
+  const input = document.getElementById('input');
+  const sendBtn = document.getElementById('sendBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const chips = document.getElementById('chips');
+  const canned = [
+    "ATLAS online. All systems nominal. How may I assist?",
+    "Affirmative. I can draft, summarize, index, or simulate. Give me a task.",
+    "Query received. Cross-referencing latent knowledge… done. What aspect matters most?",
+    "Roger. I'll keep it concise and actionable.",
+    "Standing by. I can also run diagnostics or stream events to the log."
+  ];
+  const suggestions = ['Run a diagnostic sweep','Summarize system status','Generate a report','Explain neural canvas','Simulate error handling'];
+  suggestions.forEach(s=>{
+    const c = document.createElement('span'); c.className='chip'; c.textContent=s;
+    c.addEventListener('click', ()=>{ input.value=s; input.focus(); });
+    chips.appendChild(c);
+  });
+  function addMsg(text, role){
+    const d = document.createElement('div');
+    d.className = 'msg '+role;
+    if(role==='atlas') d.innerHTML = `<span></span><div class="meta"></div>`;
+    const content = document.createElement('div'); content.className='content';
+    content.textContent = text;
+    // reorder: meta last
+    d.innerHTML=''; d.appendChild(content);
+    const meta = document.createElement('div'); meta.className='meta';
+    d.appendChild(meta);
+    chat.appendChild(d);
+    chat.scrollTop = chat.scrollHeight;
+    return {d, content, meta};
+  }
+  function streamReply(prompt){
+    if(state.chatBusy) return;
+    state.chatBusy = true; state.status='ANALYZING';
+    const userMsg = prompt.trim();
+    addMsg(userMsg,'user');
+    const atlas = addMsg('','atlas');
+    const cursor = document.createElement('span'); cursor.className='cursor'; atlas.content.appendChild(cursor);
+    const promptTokens = Math.max(1, Math.round(userMsg.split(/\s+/).length * 1.3));
+    state.queue = Math.min(8, state.queue+1);
+    const t0 = performance.now();
+    let ttft = 120 + Math.random()*280;
+    logEvent('INFO', `request accepted: prompt_tokens=${promptTokens}`);
+    logEvent('DEBUG', `scheduled on worker-0`);
+    // pick canned reply extended
+    const base = canned[Math.floor(Math.random()*canned.length)] + " " + userMsg.split(' ').slice(0,6).join(' ');
+    const words = base.split(' ');
+    let i=0;
+    setTimeout(() => {
+      state.status='RESPONDING'; spawnQueries();
+      logEvent('INFO', `first token latency: ${ttft.toFixed(0)}ms`);
+      const interval = 45 + Math.random()*35;
+      const timer = setInterval(() => {
+        if(i >= words.length){
+          clearInterval(timer);
+          cursor.remove();
+          const total = (performance.now()-t0)/1000;
+          atlas.meta.textContent = `${words.length+2} tokens · ${total.toFixed(2)} s · ${ttft.toFixed(0)} ms to first token`;
+          state.status='ONLINE';
+          state.reqs++; state.tokOut += words.length+2; state.queue = Math.max(0, state.queue-1);
+          queries = [];
+          logEvent('INFO', `done: completion_tokens=${words.length+2} latency=${(total*1000).toFixed(0)}ms`);
+          // sometimes warn on long completion
+          if(words.length > 12){ logEvent('WARN', `long completion (${words.length+2} tokens) — consider shorter prompt`); }
+          // random error occasionally
+          if(Math.random() < 0.08){
+            state.errs++;
+            logEvent('ERROR', 'CUDA OOM during generation — retrying on fallback worker');
+            logEvent('INFO', 'retry succeeded');
+          }
+          state.chatBusy=false;
+          state.ttft = ttft;
+          document.getElementById('ttft').textContent = ttft.toFixed(0)+' ms';
+          if(state.voice) speak(base);
+          return;
+        }
+        atlas.content.insertBefore(document.createTextNode((i===0?'':' ')+words[i]), cursor);
+        i++;
+        chat.scrollTop = chat.scrollHeight;
+      }, interval);
+    }, ttft);
+  }
+  function handleSend(){
+    const v = input.value.trim();
+    if(!v || state.chatBusy) return;
+    input.value='';
+    streamReply(v);
+  }
+  sendBtn.addEventListener('click', handleSend);
+  input.addEventListener('keydown', e => { if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); handleSend(); } });
+  clearBtn.addEventListener('click', ()=>{ chat.innerHTML=''; logEvent('INFO','chat cleared'); });
+
+  // ---------- helpers ----------
+  function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+  // escape already defined
+</script>
+</body>
+</html>
