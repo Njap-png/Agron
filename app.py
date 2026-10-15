@@ -155,9 +155,9 @@ def _build_prompt(message, history):
     return prompt
 
 
-DEFAULT_MAX_NEW = 48
-DEFAULT_TEMP = 0.8
-DEFAULT_TOP_P = 0.9
+DEFAULT_MAX_NEW = 192
+DEFAULT_TEMP = 0.6
+DEFAULT_TOP_P = 0.85
 
 
 def is_bad_response(text):
@@ -228,7 +228,7 @@ def generate_response(message, history):
         if mem_ctx:
             user_content = f"Relevant memory:\n{mem_ctx}\n\nUser: {message}"
         _msgs = [
-            {"role": "system", "content": "You are Agron, a helpful, warm, knowledgeable AI assistant. Speak naturally and concisely. If unsure, say so and suggest 'Search & learn web'."},
+            {"role": "system", "content": "You are Agron, a helpful, warm, knowledgeable AI assistant. Speak naturally and concisely. Stay focused on the question, avoid filler and repetition. If unsure, say so and suggest 'Search & learn web'."},
             {"role": "user", "content": user_content},
         ]
         _prompt = VOICE_TOK.apply_chat_template(_msgs, tokenize=False, add_generation_prompt=True)
