@@ -39,6 +39,27 @@ def load_interactions():
                         pass
 
 
+TOPICS_FILE = os.path.join(MEMORY_DIR, "learned_topics.json")
+learned_topics = []
+
+
+def load_topics():
+    global learned_topics
+    learned_topics = []
+    if os.path.exists(TOPICS_FILE):
+        try:
+            with open(TOPICS_FILE, "r") as f:
+                learned_topics = json.load(f)
+        except Exception:
+            learned_topics = []
+
+
+def persist_topics():
+    with IO_LOCK:
+        with open(TOPICS_FILE, "w") as f:
+            json.dump(learned_topics, f)
+
+
 def persist_interaction(rec):
     global interactions
     with IO_LOCK:
@@ -83,6 +104,10 @@ def build_model():
 TOKENIZER = build_tokenizer()
 MODEL, DEVICE = build_model()
 load_interactions()
+load_topics()
+if not learned_topics:
+    learned_topics.append("base text model (WikiText-2)")
+    persist_topics()
 
 
 def _normalize_history(history):
@@ -131,6 +156,17 @@ def generate_response(message, history):
     if low in {"who are you", "what are you", "introduce yourself"}:
         response = ("I'm Agron, an autonomous self-improving multi-agent AI core trained on text and dictionary "
                     "knowledge. I learn from our conversations—ask me anything.")
+        persist_interaction({"ts": __import__("time").time(), "user": message, "assistant": response})
+        return response
+    if low in {"what did you learn", "what have you learned", "what did you learn about", "what do you know"}:
+        parts = []
+        if interactions:
+            parts.append(f"{len(interactions)} conversation exchanges (latest: '{interactions[-1]['user'][:80]}')")
+        if learned_topics:
+            parts.append("learned topics: " + ", ".join(learned_topics[-12:]))
+        else:
+            parts.append("no specialized training runs yet, but I store every conversation")
+        response = "I've learned from you and my training sources: " + "; ".join(parts) + "."
         persist_interaction({"ts": __import__("time").time(), "user": message, "assistant": response})
         return response
     prompt = _build_prompt(message, history)
@@ -221,6 +257,9 @@ def learn_from_interactions():
             if status:
                 subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron auto-learn ({len(interactions)} interactions)"], check=True)
                 subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+            if "conversation memory" not in learned_topics:
+                learned_topics.append("conversation memory")
+            persist_topics()
             training_state["last"] = f"learned & pushed @ {len(interactions)} interactions"
         except Exception as pe:
             training_state["last"] = f"push error: {str(pe)[:150]}"
@@ -404,6 +443,8 @@ def learn_dictionary():
         if status:
             subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron dictionary learning ({len(lines)} words)"], check=True)
             subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+        learned_topics.append(f"dictionary words ({len(lines)})")
+        persist_topics()
         training_state["last"] = f"dictionary learned & pushed ({len(lines)} words)"
     except Exception as e:
         training_state["last"] = f"dict error: {str(e)[:150]}"
@@ -527,6 +568,8 @@ def learn_web(topic):
         if status:
             subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron web learning: {topic}"], check=True)
             subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+        learned_topics.append(f"web: {topic}")
+        persist_topics()
         training_state["last"] = f"web learned & pushed: {topic}"
     except Exception as e:
         training_state["last"] = f"web error: {str(e)[:150]}"
