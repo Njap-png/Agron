@@ -144,12 +144,16 @@ def generate_response(message, history):
                 top_p=DEFAULT_TOP_P,
                 pad_token_id=1,
                 eos_token_id=2,
+                repetition_penalty=1.4,
+                no_repeat_ngram_size=3,
             )
         new_tokens = output[0][input_len:]
         response = TOKENIZER.decode(new_tokens, skip_special_tokens=True).strip()
         for stop in ["\n\n", "User:", "user:"]:
             if stop in response:
                 response = response.split(stop)[0].strip()
+        import re
+        response = re.sub(r"(.{6,})\1{2,}", r"\1", response).strip()
     persist_interaction({
         "ts": time.time(),
         "user": message,
