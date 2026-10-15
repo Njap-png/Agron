@@ -23,6 +23,7 @@ TRAIN_LOCK = threading.Lock()
 
 interactions = []
 training_state = {"running": False, "steps": 0, "last": "idle", "count_at_train": 0}
+LAST_TRAIN_TIME = 0.0
 
 
 def load_interactions():
@@ -303,8 +304,10 @@ def generate_response(message, history):
         "user": message,
         "assistant": response,
     })
-    # adaptive trigger: learn every 8 new interactions
-    if len(interactions) >= 8 and len(interactions) % 8 == 0 and not training_state["running"]:
+    # adaptive trigger: self-learn from every conversation (cooldown 30s)
+    global LAST_TRAIN_TIME
+    if len(interactions) >= 4 and not training_state["running"] and (time.time() - LAST_TRAIN_TIME) >= 120:
+        LAST_TRAIN_TIME = time.time()
         threading.Thread(target=learn_from_interactions, daemon=True).start()
     return response
 
