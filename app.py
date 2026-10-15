@@ -201,6 +201,18 @@ def safe_web_answer(query):
 def generate_response(message, history):
     low = message.strip().lower().strip("!?.,")
     greetings = {"hello", "hi", "hey", "greetings", "howdy", "yo"}
+    search_intent = any(k in low for k in ["search", "find", "look up", "lookup", "browse", "web"])
+    if search_intent:
+        res = web_search(message, 5)
+        if res:
+            lines = [f"{i+1}. {r['title']} — {r.get('snippet','')} ({r['url']})" for i, r in enumerate(res)]
+            response = "Here are live web results:\n" + "\n".join(lines)
+            persist_interaction({"ts": __import__("time").time(), "user": message, "assistant": response})
+            return response
+        else:
+            response = "I couldn't find web results for that query. Try rephrasing it."
+            persist_interaction({"ts": __import__("time").time(), "user": message, "assistant": response})
+            return response
     if low in greetings:
         response = "Hello! I'm Agron, a self-improving neural interface. How can I help you today?"
         persist_interaction({"ts": __import__("time").time(), "user": message, "assistant": response})
@@ -221,14 +233,25 @@ def generate_response(message, history):
         response = "I've learned from you and my training sources: " + "; ".join(parts) + "."
         persist_interaction({"ts": __import__("time").time(), "user": message, "assistant": response})
         return response
+    _web_ctx = ""
+    try:
+        if len(message.strip()) >= 4:
+            _res = web_search(message, 3)
+            _lines = [f"- {r['title']}: {r.get('snippet','')}" for r in _res if (r.get('snippet') or '').strip()]
+            if _lines:
+                _web_ctx = "Web search results (live):\n" + "\n".join(_lines[:3])
+    except Exception:
+        _web_ctx = ""
     if VOICE_MODEL is not None:
         mem_lines = [f"User: {r['user']}\nAgron: {r['assistant']}" for r in interactions[-3:]]
         mem_ctx = "\n".join(mem_lines)
         user_content = message
         if mem_ctx:
             user_content = f"Relevant memory:\n{mem_ctx}\n\nUser: {message}"
+        if _web_ctx:
+            user_content = f"{_web_ctx}\n\n{user_content}\n\nAnswer using the live web results above."
         _msgs = [
-            {"role": "system", "content": "You are Agron, a helpful, warm, knowledgeable AI assistant. Speak naturally and concisely. Stay focused on the question, avoid filler and repetition. If unsure, say so and suggest 'Search & learn web'."},
+            {"role": "system", "content": "You are Agron, a helpful AI assistant. You do have live web search results whenever they are included in the user message. Use them to answer accurately. Never say you cannot search or browse the internet. Stay concise and focused. If still unsure, suggest 'Search & learn web'."},
             {"role": "user", "content": user_content},
         ]
         _prompt = VOICE_TOK.apply_chat_template(_msgs, tokenize=False, add_generation_prompt=True)
@@ -606,26 +629,25 @@ def _decode_bing(url):
 
 def web_search(query, max_results=5):
     try:
-        r = requests.get("https://www.bing.com/search", params={"q": query}, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=20)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36", "Accept": "text/html"}
+        r = requests.post("https://html.duckduckgo.com/html/", data={"q": query}, headers=headers, timeout=25)
         soup = BeautifulSoup(r.text, "html.parser")
         out = []
-        for h in soup.select("h2 a"):
-            title = h.get_text(strip=True)
-            raw = h.get("href", "")
-            link = _decode_bing(raw) if "bing.com/ck/a" in raw else raw
-            parent = h.find_parent("li") or h.find_parent("div")
-            snippet = ""
-            if parent:
-                p = parent.select_one("p, .b_caption p, .snippet")
-                if p:
-                    snippet = p.get_text(strip=True)
+        for res in soup.select(".result"):
+            a = res.select_one("a.result__a")
+            if not a:
+                continue
+            title = a.get_text(strip=True)
+            link = a.get("href", "")
+            sn = res.select_one(".result__snippet")
+            snippet = sn.get_text(strip=True) if sn else ""
             if link and title:
                 out.append({"title": title, "url": link, "snippet": snippet})
             if len(out) >= max_results:
                 break
         if not out:
             try:
-                dr = requests.get("https://api.duckduckgo.com/", params={"q": query, "format": "json", "no_html": "1"}, timeout=20)
+                dr = requests.get("https://api.duckduckgo.com/", params={"q": query, "format": "json", "no_html": "1"}, headers=headers, timeout=20)
                 dd = dr.json()
                 if dd.get("Abstract"):
                     out.append({"title": dd.get("Heading", query), "url": dd.get("AbstractURL", ""), "snippet": dd.get("Abstract", "")})
@@ -635,6 +657,7 @@ def web_search(query, max_results=5):
     except Exception as e:
         training_state["last"] = f"search error: {str(e)[:100]}"
         return []
+
 
 
 def crawl_page(url):
