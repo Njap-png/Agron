@@ -255,7 +255,7 @@ def generate_response(message, history):
         if _web_ctx:
             user_content = f"{_web_ctx}\n\n{user_content}\n\nAnswer using the live web results above."
         _msgs = [
-            {"role": "system", "content": "You are Agron, a helpful AI assistant. You do have live web search results whenever they are included in the user message. Use them to answer accurately. Never say you cannot search or browse the internet. Stay concise and focused. If still unsure, suggest 'Search & learn web'."},
+            {"role": "system", "content": "You are Agron, a self-improving AI assistant. Reason step-by-step (premises, plan, critique, refine), then answer concisely. Use live web search results when provided. Never say you cannot search or browse. If unsure, suggest 'Search & learn web'."},
             {"role": "user", "content": user_content},
         ]
         _prompt = VOICE_TOK.apply_chat_template(_msgs, tokenize=False, add_generation_prompt=True)
@@ -306,9 +306,9 @@ def generate_response(message, history):
     })
     # adaptive trigger: self-learn from every conversation (cooldown 30s)
     global LAST_TRAIN_TIME
-    if len(interactions) >= 4 and not training_state["running"] and (time.time() - LAST_TRAIN_TIME) >= 120:
+    if len(interactions) >= 8 and not training_state["running"] and (time.time() - LAST_TRAIN_TIME) >= 300:
         LAST_TRAIN_TIME = time.time()
-        threading.Thread(target=learn_from_interactions, daemon=True).start()
+        threading.Thread(target=learn_from_scratch_memory, daemon=True).start()
     return response
 
 
@@ -762,7 +762,13 @@ def self_update():
 
 EVOLVE_TOPICS = [
     "artificial intelligence self improvement",
-    "plant design software PDMS",
+    "chain of thought reasoning",
+    "tree of thought search",
+    "self-consistency decoding",
+    "recursive self improvement algorithms",
+    "react agent pattern",
+    "retrieval augmented generation",
+    "algorithm design and complexity",
     "machine learning transformers",
     "python programming best practices",
     "data structures algorithms",
@@ -958,6 +964,55 @@ def create_tool_from_description(desc):
 register_builtin_tools()
 load_tools()
 
+
+def learn_from_scratch_memory():
+    global MODEL, LAST_TRAIN_TIME
+    if not TRAIN_LOCK.acquire(blocking=False):
+        return
+    training_state["running"] = True
+    training_state["last"] = "building from-scratch corpus..."
+    try:
+        if len(interactions) < 6:
+            raise RuntimeError(f"need at least 6 interactions (have {len(interactions)})")
+        corpus = os.path.join(MEMORY_DIR, "scratch_corpus.txt")
+        lines = [f"User: {r['user']}\nAgron: {r['assistant']}" for r in interactions]
+        with open(corpus, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(lines))
+        out_dir = "/content/agron-from-scratch-memory"
+        training_state["last"] = f"training from scratch on {len(interactions)} interactions..."
+        subprocess.run([
+            "python3", os.path.join(ROOT, "train_from_scratch.py"),
+            "--size", "current", "--steps", "300",
+            "--dataset", "file", "--file", corpus,
+            "--output", out_dir
+        ], check=True, timeout=600)
+        import shutil
+        shutil.copyfile(os.path.join(out_dir, "final", "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
+        # reload weights into the live model
+        try:
+            st = load_file(os.path.join(ROOT, "model.safetensors"))
+            with IO_LOCK:
+                MODEL.load_state_dict(st)
+        except Exception:
+            pass
+        learned_topics.append("from-scratch memory model")
+        persist_topics()
+        training_state["last"] = "self-updating from scratch..."
+        subprocess.run(["git", "-C", ROOT, "add", "model.safetensors", "memory/scratch_corpus.txt"], check=True)
+        subprocess.run(["git", "-C", ROOT, "add", "memory/learned_topics.json"], check=False)
+        status = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
+        if status:
+            subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron from-scratch learning ({len(interactions)} interactions)"], check=True)
+            subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+        LAST_TRAIN_TIME = time.time()
+        training_state["last"] = f"from-scratch learned & pushed ({len(interactions)} interactions)"
+    except Exception as e:
+        training_state["last"] = f"from-scratch error: {str(e)[:200]}"
+    finally:
+        training_state["running"] = False
+        TRAIN_LOCK.release()
+
+
 with gr.Blocks(title="Agron Neural Interface") as demo:
     gr.HTML(PARTICLE_HTML, js_on_load=PARTICLE_JS)
     gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>", elem_classes="agron-card")
@@ -991,6 +1046,7 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
             create_btn = gr.Button("Create tool")
             gr.Markdown("### Learning controls")
             learn_btn = gr.Button("Train now on memory")
+            scratch_btn = gr.Button("Train from scratch (no fine-tune)")
             dict_btn = gr.Button("Learn dictionary words")
             web_topic = gr.Textbox(label="Web topic / search query", placeholder="e.g. transformer architecture", lines=1)
             web_btn = gr.Button("Search & learn web")
@@ -1046,6 +1102,14 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
     tool_btn.click(run_tool_fn, [tool_dd, tool_in], tool_out)
     create_btn.click(create_tool_fn, tool_desc, status)
     learn_btn.click(do_learn, outputs=status)
+    def do_scratch():
+        if training_state["running"]:
+            return "training already running"
+        if len(interactions) < 6:
+            return f"need at least 6 interactions (have {len(interactions)})"
+        threading.Thread(target=learn_from_scratch_memory, daemon=True).start()
+        return "from-scratch training started in background..."
+    scratch_btn.click(do_scratch, outputs=status)
     dict_btn.click(do_dict, outputs=status)
     web_btn.click(do_web, outputs=status)
     def do_evolve():
