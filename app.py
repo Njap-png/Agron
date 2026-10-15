@@ -2,6 +2,7 @@ import os
 import json
 import time
 import threading
+import subprocess
 import torch
 import gradio as gr
 from datasets import Dataset
@@ -111,7 +112,12 @@ def _build_prompt(message, history):
     return prompt
 
 
-def generate_response(message, history, max_new_tokens, temperature, top_p):
+DEFAULT_MAX_NEW = 96
+DEFAULT_TEMP = 0.8
+DEFAULT_TOP_P = 0.9
+
+
+def generate_response(message, history):
     prompt = _build_prompt(message, history)
     with IO_LOCK:
         inputs = TOKENIZER(prompt, return_tensors="pt").to(DEVICE)
@@ -119,10 +125,10 @@ def generate_response(message, history, max_new_tokens, temperature, top_p):
         with torch.no_grad():
             output = MODEL.generate(
                 **inputs,
-                max_new_tokens=int(max_new_tokens),
+                max_new_tokens=DEFAULT_MAX_NEW,
                 do_sample=True,
-                temperature=float(temperature),
-                top_p=float(top_p),
+                temperature=DEFAULT_TEMP,
+                top_p=DEFAULT_TOP_P,
                 pad_token_id=1,
                 eos_token_id=2,
             )
@@ -180,9 +186,22 @@ def learn_from_interactions():
             # Trainer mutated in place; persist to file
             save_file({k: v.detach().cpu().contiguous() for k, v in state.items()}, os.path.join(out_dir, "model.safetensors"))
             MODEL.load_state_dict(torch.load(os.path.join(out_dir, "pytorch_model.bin"), map_location=DEVICE) if os.path.exists(os.path.join(out_dir, "pytorch_model.bin")) else state)
+        # persist trained weights to the repo-tracked file
+        import shutil
+        shutil.copyfile(os.path.join(out_dir, "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
         training_state["steps"] += 30
         training_state["count_at_train"] = len(interactions)
-        training_state["last"] = f"learned @ {len(interactions)} interactions"
+        # auto-push to GitHub (triggers HF sync workflow)
+        try:
+            subprocess.run(["git", "-C", ROOT, "add", "model.safetensors"], check=True)
+            subprocess.run(["git", "-C", ROOT, "add", "memory/interactions.jsonl"], check=False)
+            status = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
+            if status:
+                subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron auto-learn ({len(interactions)} interactions)"], check=True)
+                subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+            training_state["last"] = f"learned & pushed @ {len(interactions)} interactions"
+        except Exception as pe:
+            training_state["last"] = f"push error: {str(pe)[:150]}"
     except Exception as e:
         training_state["last"] = f"learn error: {str(e)[:120]}"
     finally:
@@ -190,8 +209,8 @@ def learn_from_interactions():
         TRAIN_LOCK.release()
 
 
-def chat_fn(message, history, max_new_tokens, temperature, top_p):
-    return generate_response(message, history, max_new_tokens, temperature, top_p)
+def chat_fn(message, history):
+    return generate_response(message, history)
 
 
 # ---------- UI ----------
@@ -276,10 +295,7 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
             with gr.Row():
                 send = gr.Button("Transmit", variant="primary")
                 clear = gr.Button("Clear")
-            with gr.Row():
-                max_new = gr.Slider(8, 160, value=64, step=1, label="Max tokens")
-                temp = gr.Slider(0.2, 1.5, value=0.8, step=0.05, label="Temperature")
-                topp = gr.Slider(0.5, 1.0, value=0.9, step=0.05, label="Top-p")
+            gr.Markdown("⚙ decoding: auto (max 96 tokens · adaptive temp 0.8 · top-p 0.9)")
         with gr.Column(scale=1, elem_classes="agron-card"):
             gr.Markdown("### Core status")
             status = gr.Textbox(value=f"interactions: {len(interactions)} | {training_state['last']}", label="Learning", interactive=False, elem_classes="status-box")
@@ -290,15 +306,15 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
     def respond(message, history):
         if not message.strip():
             return history, ""
-        response = generate_response(message, history, max_new.value, temp.value, topp.value)
+        response = generate_response(message, history)
         history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": response}]
         return history, ""
 
     def do_learn():
         if training_state["running"]:
             return f"training already running · {training_state['last']}"
-        if len(interactions) < 4:
-            return f"need at least 4 interactions (have {len(interactions)})"
+        if len(interactions) < 2:
+            return f"need at least 2 interactions (have {len(interactions)})"
         threading.Thread(target=learn_from_interactions, daemon=True).start()
         return "training started in background..."
 
