@@ -1072,6 +1072,15 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
     gr.HTML(PARTICLE_HTML, js_on_load=PARTICLE_JS)
     gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>", elem_classes="agron-card")
     gr.Markdown("<div class='agron-sub'>Self-improving multi-agent core · particles = live network · learning from every exchange</div>")
+    # Full-page AGRØN HUD dashboard
+    try:
+        import base64 as _b64
+        _dash_html = open(os.path.join(ROOT, "agron_dashboard.html")).read()
+        _dash_b64 = _b64.b64encode(_dash_html.encode()).decode()
+        gr.HTML(f'<iframe src="data:text/html;base64,{_dash_b64}" style="width:100%;height:92vh;border:1px solid rgba(34,211,238,0.35);border-radius:12px;" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>')
+    except Exception as e:
+        gr.Markdown(f"Dashboard not available: {e}")
+
     with gr.Row():
         with gr.Column(scale=1, elem_classes="agron-card"):
             gr.Markdown("<h3 class='agron-title'>SYSTEM</h3>")
