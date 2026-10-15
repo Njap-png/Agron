@@ -412,23 +412,47 @@ def learn_dictionary():
         TRAIN_LOCK.release()
 
 
-def duckduckgo_search(query, max_results=5):
+import base64 as _b64
+
+def _decode_bing(url):
     try:
-        r = requests.get("https://html.duckduckgo.com/html/", params={"q": query}, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        import urllib.parse
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        u = qs.get("u", [""])[0]
+        if u.startswith("a1"):
+            u = u[2:]
+        pad = "=" * (-len(u) % 4)
+        return _b64.b64decode(u + pad).decode()
+    except Exception:
+        return url
+
+def web_search(query, max_results=5):
+    try:
+        r = requests.get("https://www.bing.com/search", params={"q": query}, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=20)
         soup = BeautifulSoup(r.text, "html.parser")
         out = []
-        for res in soup.select(".result"):
-            a = res.select_one("a.result__a")
-            if not a:
-                continue
-            link = a.get("href", "")
-            title = a.get_text(strip=True)
-            sn = res.select_one(".result__snippet")
-            snippet = sn.get_text(strip=True) if sn else ""
-            if link:
+        for h in soup.select("h2 a"):
+            title = h.get_text(strip=True)
+            raw = h.get("href", "")
+            link = _decode_bing(raw) if "bing.com/ck/a" in raw else raw
+            parent = h.find_parent("li") or h.find_parent("div")
+            snippet = ""
+            if parent:
+                p = parent.select_one("p, .b_caption p, .snippet")
+                if p:
+                    snippet = p.get_text(strip=True)
+            if link and title:
                 out.append({"title": title, "url": link, "snippet": snippet})
             if len(out) >= max_results:
                 break
+        if not out:
+            try:
+                dr = requests.get("https://api.duckduckgo.com/", params={"q": query, "format": "json", "no_html": "1"}, timeout=20)
+                dd = dr.json()
+                if dd.get("Abstract"):
+                    out.append({"title": dd.get("Heading", query), "url": dd.get("AbstractURL", ""), "snippet": dd.get("Abstract", "")})
+            except Exception:
+                pass
         return out
     except Exception as e:
         training_state["last"] = f"search error: {str(e)[:100]}"
@@ -456,7 +480,7 @@ def learn_web(topic):
     training_state["running"] = True
     training_state["last"] = f"searching web: {topic}"
     try:
-        results = duckduckgo_search(topic, 5)
+        results = web_search(topic, 5)
         if not results:
             raise RuntimeError("no search results")
         lines = []
