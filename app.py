@@ -141,9 +141,47 @@ def _build_prompt(message, history):
     return prompt
 
 
-DEFAULT_MAX_NEW = 96
+DEFAULT_MAX_NEW = 48
 DEFAULT_TEMP = 0.8
 DEFAULT_TOP_P = 0.9
+
+
+def is_bad_response(text):
+    import re
+    t = (text or "").strip()
+    if len(t) < 3:
+        return True
+    if "@-@" in t or t.count('"') > 6:
+        return True
+    if re.search(r"(.{8,})\\1", t):
+        return True
+    words = t.split()
+    if len(words) > 120:
+        return True
+    # gibberish heuristic: too many short tokens
+    if sum(1 for w in words if len(w) <= 2) > len(words) * 0.6 and len(words) > 12:
+        return True
+    if text.count("was a") >= 2 or text.count(" in the ") >= 2 or text.count(" the ") >= 6:
+        return True
+    if "@-@" in t or t.count('"') > 4:
+        return True
+    return False
+
+
+def safe_web_answer(query):
+    try:
+        results = web_search(query, 3)
+        if results:
+            sn = (results[0].get("snippet") or "").strip()
+            if len(sn) >= 20:
+                return f"{sn} (source: {results[0]['title']})"
+            # try crawl
+            page = crawl_page(results[0]["url"])
+            if page:
+                return f"{page[:300]}... (source: {results[0]['title']})"
+    except Exception:
+        pass
+    return None
 
 
 def generate_response(message, history):
@@ -184,6 +222,7 @@ def generate_response(message, history):
                 eos_token_id=2,
                 repetition_penalty=1.4,
                 no_repeat_ngram_size=3,
+                top_k=40,
             )
         new_tokens = output[0][input_len:]
         response = TOKENIZER.decode(new_tokens, skip_special_tokens=True).strip()
@@ -192,6 +231,9 @@ def generate_response(message, history):
                 response = response.split(stop)[0].strip()
         import re
         response = re.sub(r"(.{6,})\1{2,}", r"\1", response).strip()
+    if is_bad_response(response):
+        sw = safe_web_answer(message)
+        response = sw if sw else "I'm not sure. Could you rephrase, or use 'Search & learn web' to teach me."
     persist_interaction({
         "ts": time.time(),
         "user": message,
