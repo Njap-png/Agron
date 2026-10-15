@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>ATLAS — Neural Command Dashboard</title>
+<title>AGRØN — Neural Command Dashboard</title>
 <style>
   :root {
     --bg: #020617;
     --panel: rgba(8, 20, 45, 0.55);
     --border: rgba(34, 211, 238, 0.35);
     --cyan: #22d3ee;
-    --amber: #fbbf24;
+    --amber: #a78bfa;
     --text: #e2e8f0;
     --muted: #94a3b8;
     --red: #f87171;
@@ -108,6 +108,14 @@
   .log .ERROR { color: var(--red); }
   .log .DEBUG { color: #a78bfa; }
   .pause-row { display: flex; gap: 6px; margin-bottom: 6px; }
+
+  body::after {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
+    background: repeating-linear-gradient(0deg, rgba(34,211,238,0.06) 0px, rgba(34,211,238,0.06) 1px, transparent 1px, transparent 3px);
+    opacity: 0.35; mix-blend-mode: overlay;
+  }
+  .app { border: 1px solid rgba(34,211,238,0.4); box-shadow: 0 0 40px rgba(34,211,238,0.25), inset 0 0 60px rgba(34,211,238,0.05); }
+
   @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } body { overflow: auto; } }
 </style>
 </head>
@@ -115,10 +123,10 @@
 <div class="app">
   <header>
     <div class="title">
-      <h1>ATLAS</h1>
-      <div class="sub">AUTONOMOUS TACTICAL LANGUAGE &amp; ANALYSIS SYSTEM</div>
+      <h1>AGRØN</h1>
+      <div class="sub">AUTONOMOUS ADAPTIVE LEARNING &amp; ORCHESTRATION NETWORK</div>
     </div>
-    <div class="tag">atlas-7b-instruct · q4_k_m · 8k ctx</div>
+    <div class="tag">agron-voice · 3b-instruct · 8k ctx</div>
     <div class="header-right">
       <div class="clock" id="clock">00:00:00</div>
       <button class="voice-btn" id="voiceBtn">VOICE OFF</button>
@@ -183,7 +191,7 @@
           <div class="chat" id="chat"></div>
           <div class="input-row" style="margin-top:6px;">
             <button class="clear" id="clearBtn">Clear</button>
-            <textarea id="input" placeholder="Speak to ATLAS… (Enter to send, Shift+Enter newline)"></textarea>
+            <textarea id="input" placeholder="Speak to AGRØN… (Enter to send, Shift+Enter newline)"></textarea>
             <button class="send" id="sendBtn">Send</button>
           </div>
         </div>
@@ -273,7 +281,7 @@
 
   // boot sequence
   const bootSeq = [
-    'INFO: ATLAS boot sequence initialized',
+    'INFO: AGRØN boot sequence initialized',
     'DEBUG: loading neural weights (q4_k_m)',
     'INFO: GPU context created (simulated)',
     'INFO: vector store ready',
@@ -282,7 +290,7 @@
   ];
   let bi = 0;
   const bootTimer = setInterval(() => {
-    if(bi >= bootSeq.length){ clearInterval(bootTimer); logEvent('INFO','ATLAS online and ready.'); return; }
+    if(bi >= bootSeq.length){ clearInterval(bootTimer); logEvent('INFO','AGRØN online and ready.'); return; }
     const parts = bootSeq[bi].split(':');
     logEvent(parts[0], parts.slice(1).join(':').trim());
     bi++;
@@ -508,7 +516,7 @@
   const clearBtn = document.getElementById('clearBtn');
   const chips = document.getElementById('chips');
   const canned = [
-    "ATLAS online. All systems nominal. How may I assist?",
+    "AGRØN online. All systems nominal. How may I assist?",
     "Affirmative. I can draft, summarize, index, or simulate. Give me a task.",
     "Query received. Cross-referencing latent knowledge… done. What aspect matters most?",
     "Roger. I'll keep it concise and actionable.",
