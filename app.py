@@ -104,7 +104,7 @@ def _normalize_history(history):
 
 def _build_prompt(message, history):
     ctx_pairs = interactions[-5:]
-    prompt = "### Agron memory (learned from prior use)\n"
+    prompt = "Agron is a helpful, concise AI assistant.\n### Agron memory (learned from prior use)\n"
     for r in ctx_pairs:
         prompt += f"User: {r['user']}\nAgron: {r['assistant']}\n"
     prompt += "### Conversation\n"
@@ -120,6 +120,17 @@ DEFAULT_TOP_P = 0.9
 
 
 def generate_response(message, history):
+    low = message.strip().lower().strip("!?.,")
+    greetings = {"hello", "hi", "hey", "greetings", "howdy", "yo"}
+    if low in greetings:
+        response = "Hello! I'm Agron, a self-improving neural interface. How can I help you today?"
+        persist_interaction({"ts": __import__("time").time(), "user": message, "assistant": response})
+        return response
+    if low in {"who are you", "what are you", "introduce yourself"}:
+        response = ("I'm Agron, an autonomous self-improving multi-agent AI core trained on text and dictionary "
+                    "knowledge. I learn from our conversations—ask me anything.")
+        persist_interaction({"ts": __import__("time").time(), "user": message, "assistant": response})
+        return response
     prompt = _build_prompt(message, history)
     with IO_LOCK:
         inputs = TOKENIZER(prompt, return_tensors="pt").to(DEVICE)
@@ -136,6 +147,9 @@ def generate_response(message, history):
             )
         new_tokens = output[0][input_len:]
         response = TOKENIZER.decode(new_tokens, skip_special_tokens=True).strip()
+        for stop in ["\n\n", "User:", "user:"]:
+            if stop in response:
+                response = response.split(stop)[0].strip()
     persist_interaction({
         "ts": time.time(),
         "user": message,
