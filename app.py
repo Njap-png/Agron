@@ -55,7 +55,10 @@ def load_topics():
 
 
 def persist_topics():
+    global learned_topics
     with IO_LOCK:
+        normalized = ["dictionary words" if str(x).startswith("dictionary words") else x for x in learned_topics]
+        learned_topics = list(dict.fromkeys(normalized))
         with open(TOPICS_FILE, "w") as f:
             json.dump(learned_topics, f)
 
@@ -603,7 +606,7 @@ def learn_dictionary():
         if status:
             subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron dictionary learning ({len(lines)} words)"], check=True)
             subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
-        learned_topics.append(f"dictionary words ({len(lines)})")
+        learned_topics.append("dictionary words")
         persist_topics()
         training_state["last"] = f"dictionary learned & pushed ({len(lines)} words)"
     except Exception as e:
