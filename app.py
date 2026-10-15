@@ -386,14 +386,45 @@ def chat_fn(message, history):
 # ---------- UI ----------
 PARTICLE_HTML = r"""
 <style>
-  body, .gradio-container { background: #020617 !important; }
+  @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=VT323&display=swap');
+  html, body { margin: 0 !important; height: 100vh !important; overflow: hidden !important; background: radial-gradient(1200px 800px at 50% 40%, #0a1a3a 0%, #020617 70%) !important; color: #e2e8f0 !important; font-family: "Segoe UI", "Orbitron", monospace !important; }
+  body, .gradio-container, .app { background: transparent !important; position: relative; z-index: 1; }
   #agron-bg-canvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 0; }
-  .gradio-container { position: relative; z-index: 1; background: transparent !important; }
-  .agron-card { background: rgba(8, 20, 40, 0.55) !important; border: 1px solid rgba(34, 211, 238, 0.35) !important; border-radius: 14px !important; backdrop-filter: blur(6px); box-shadow: 0 0 24px rgba(34,211,238,0.15); }
-  .agron-title { color: #67e8f9; text-shadow: 0 0 18px rgba(34,211,238,0.8); font-family: "Orbitron", "Segoe UI", sans-serif; letter-spacing: 2px; text-align: center; margin-bottom: 4px; }
-  .agron-sub { color: #a5f3fc; text-align: center; font-size: 12px; opacity: 0.8; margin-bottom: 12px; }
-  .status-box textarea { color: #67e8f9 !important; background: rgba(2, 6, 23, 0.6) !important; }
-  footer { display: none !important; }
+  .gradio-container {
+    max-width: 100vw !important; height: 100vh !important; padding: 10px 14px !important; gap: 10px !important;
+    border: 1px solid rgba(34, 211, 238, 0.4) !important;
+    box-shadow: 0 0 40px rgba(34,211,238,0.25), inset 0 0 60px rgba(34,211,238,0.05) !important;
+  }
+  .gradio-container::before {
+    content: "AGRØN · NEURAL COMMAND HUD";
+    display: block; width: 100%; color: #22d3ee; text-shadow: 0 0 18px rgba(34,211,238,0.85);
+    font-family: "Orbitron", monospace; letter-spacing: 4px; font-size: 22px; font-weight: 700; text-align: center; padding-bottom: 6px;
+  }
+  body::after {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
+    background: repeating-linear-gradient(0deg, rgba(34,211,238,0.06) 0px, rgba(34,211,238,0.06) 1px, transparent 1px, transparent 3px);
+    opacity: 0.35; mix-blend-mode: overlay;
+  }
+  .agron-card {
+    background: rgba(8, 20, 45, 0.55) !important; border: 1px solid rgba(34, 211, 238, 0.35) !important;
+    border-radius: 12px !important; backdrop-filter: blur(6px); box-shadow: 0 0 18px rgba(34,211,238,0.12) !important;
+    padding: 8px !important;
+  }
+  .agron-card h1, .agron-card h2, .agron-card h3 { color: #67e8f9; text-shadow: 0 0 8px rgba(34,211,238,0.5); font-family: "Orbitron","Segoe UI",sans-serif; letter-spacing: 2px; }
+  .agron-title { color: #67e8f9; text-shadow: 0 0 18px rgba(34,211,238,0.8); font-family: "Orbitron", "Segoe UI", sans-serif; letter-spacing: 2px; text-align: center; margin-bottom: 4px; text-transform: uppercase; }
+  .agron-sub { color: #a5f3fc; text-align: center; font-size: 12px; opacity: 0.8; margin-bottom: 12px; letter-spacing: 1px; }
+  .status-box textarea { color: #67e8f9 !important; background: rgba(2, 6, 23, 0.6) !important; font-family: monospace !important; }
+  .gradio-container input, .gradio-container textarea, .gradio-container select, .block {
+    background: rgba(2, 6, 23, 0.55) !important; color: #e2e8f0 !important;
+    border: 1px solid rgba(34, 211, 238, 0.35) !important; border-radius: 8px !important; backdrop-filter: blur(4px) !important;
+  }
+  .gradio-container button { border: 1px solid #22d3ee !important; color: #22d3ee !important; background: rgba(34,211,238,0.08) !important; letter-spacing: 1px; text-transform: uppercase; }
+  .gradio-container button:hover { background: rgba(34,211,238,0.18) !important; box-shadow: 0 0 12px rgba(34,211,238,0.35); }
+  .gradio-container button.primary, .gradio-container button[variant="primary"] { background: rgba(34, 211, 238, 0.18) !important; font-weight: 700; }
+  .gr-chatbot, .chatbot { background: rgba(2, 6, 23, 0.48) !important; border: 1px solid rgba(34, 211, 238, 0.35) !important; border-radius: 10px !important; }
+  .markdown-text { font-family: "Segoe UI", "Orbitron", sans-serif !important; }
+  .gr-group, .gr-row { min-height: 0 !important; }
+  footer, .foot, .contain { display: none !important; }
 </style>
 <canvas id="agron-bg-canvas"></canvas>
 """
@@ -1072,15 +1103,6 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
     gr.HTML(PARTICLE_HTML, js_on_load=PARTICLE_JS)
     gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>", elem_classes="agron-card")
     gr.Markdown("<div class='agron-sub'>Self-improving multi-agent core · particles = live network · learning from every exchange</div>")
-    # Full-page AGRØN HUD dashboard
-    try:
-        import base64 as _b64
-        _dash_html = open(os.path.join(ROOT, "agron_dashboard.html")).read()
-        _dash_b64 = _b64.b64encode(_dash_html.encode()).decode()
-        gr.HTML(f'<iframe src="data:text/html;base64,{_dash_b64}" style="width:100%;height:92vh;border:1px solid rgba(34,211,238,0.35);border-radius:12px;" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>')
-    except Exception as e:
-        gr.Markdown(f"Dashboard not available: {e}")
-
     with gr.Row():
         with gr.Column(scale=1, elem_classes="agron-card"):
             gr.Markdown("<h3 class='agron-title'>SYSTEM</h3>")
