@@ -5,6 +5,8 @@ import random
 import threading
 import subprocess
 import urllib.request
+import requests
+from bs4 import BeautifulSoup
 import torch
 import gradio as gr
 from datasets import Dataset
@@ -410,6 +412,105 @@ def learn_dictionary():
         TRAIN_LOCK.release()
 
 
+def duckduckgo_search(query, max_results=5):
+    try:
+        r = requests.get("https://html.duckduckgo.com/html/", params={"q": query}, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        soup = BeautifulSoup(r.text, "html.parser")
+        out = []
+        for res in soup.select(".result"):
+            a = res.select_one("a.result__a")
+            if not a:
+                continue
+            link = a.get("href", "")
+            title = a.get_text(strip=True)
+            sn = res.select_one(".result__snippet")
+            snippet = sn.get_text(strip=True) if sn else ""
+            if link:
+                out.append({"title": title, "url": link, "snippet": snippet})
+            if len(out) >= max_results:
+                break
+        return out
+    except Exception as e:
+        training_state["last"] = f"search error: {str(e)[:100]}"
+        return []
+
+
+def crawl_page(url):
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "form"]):
+            tag.decompose()
+        text = " ".join(soup.get_text(separator=" ", strip=True).split())
+        return text[:2500]
+    except Exception:
+        return ""
+
+
+def learn_web(topic):
+    global MODEL
+    if not TRAIN_LOCK.acquire(blocking=False):
+        return
+    training_state["running"] = True
+    training_state["last"] = f"searching web: {topic}"
+    try:
+        results = duckduckgo_search(topic, 5)
+        if not results:
+            raise RuntimeError("no search results")
+        lines = []
+        for i, res in enumerate(results):
+            training_state["last"] = f"crawling {i+1}/{len(results)}: {res['title'][:40]}"
+            page = crawl_page(res["url"])
+            lines.append(f"Topic: {topic}\nSource: {res['title']} ({res['url']})\nSnippet: {res['snippet']}\nContent: {page}")
+            time.sleep(1)
+        corpus = "\n\n".join(lines)
+        if not corpus.strip():
+            raise RuntimeError("empty web corpus")
+        toks = TOKENIZER(corpus)["input_ids"]
+        block = 64
+        chunks = [toks[i:i+block] for i in range(0, max(1, len(toks) - block + 1), block)]
+        chunks = [c for c in chunks if len(c) == block]
+        if not chunks:
+            raise RuntimeError("not enough web text")
+        ds = Dataset.from_dict({"input_ids": chunks, "labels": [c[:] for c in chunks]})
+        out_dir = os.path.join("/content", "agron-web")
+        os.makedirs(out_dir, exist_ok=True)
+        args = TrainingArguments(
+            output_dir=out_dir,
+            per_device_train_batch_size=2,
+            max_steps=60,
+            learning_rate=1e-4,
+            optim="adamw_torch",
+            fp16=True if torch.cuda.is_available() else False,
+            logging_steps=20,
+            save_strategy="no",
+            report_to=[],
+            remove_unused_columns=True,
+        )
+        collator = DataCollatorForLanguageModeling(tokenizer=TOKENIZER, mlm=False)
+        trainer = Trainer(model=MODEL, args=args, train_dataset=ds, data_collator=collator, processing_class=TOKENIZER)
+        training_state["last"] = f"training on web content for '{topic}'..."
+        trainer.train()
+        save_file({k: v.detach().cpu().contiguous() for k, v in MODEL.state_dict().items()}, os.path.join(out_dir, "model.safetensors"))
+        import shutil
+        shutil.copyfile(os.path.join(out_dir, "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
+        training_state["last"] = "pushing web-learned model..."
+        subprocess.run(["git", "-C", ROOT, "add", "model.safetensors"], check=True)
+        subprocess.run(["git", "-C", ROOT, "add", "memory/interactions.jsonl"], check=False)
+        status = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
+        if status:
+            subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron web learning: {topic}"], check=True)
+            subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+        training_state["last"] = f"web learned & pushed: {topic}"
+    except Exception as e:
+        training_state["last"] = f"web error: {str(e)[:150]}"
+    finally:
+        training_state["running"] = False
+        TRAIN_LOCK.release()
+
+
 with gr.Blocks(title="Agron Neural Interface") as demo:
     gr.HTML(PARTICLE_HTML, js_on_load=PARTICLE_JS)
     gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>", elem_classes="agron-card")
@@ -427,6 +528,8 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
             status = gr.Textbox(value=f"interactions: {len(interactions)} | {training_state['last']}", label="Learning", interactive=False, elem_classes="status-box")
             learn_btn = gr.Button("Train now on memory")
             dict_btn = gr.Button("Learn dictionary words")
+            web_topic = gr.Textbox(label="Web topic / search query", placeholder="e.g. transformer architecture", lines=1)
+            web_btn = gr.Button("Search & learn web")
             gr.Markdown("### Network metrics")
             metrics = gr.Textbox(value="nodes: 130 · mesh: active · LFS: ok", label="Diagnostics", interactive=False)
 
@@ -456,8 +559,18 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
             return "training already running"
         threading.Thread(target=learn_dictionary, daemon=True).start()
         return "dictionary learning started in background..."
+
+    def do_web():
+        if training_state["running"]:
+            return "training already running"
+        q = web_topic.value.strip()
+        if not q:
+            return "enter a topic/query first"
+        threading.Thread(target=learn_web, args=(q,), daemon=True).start()
+        return f"web learning started: {q}"
     learn_btn.click(do_learn, outputs=status)
     dict_btn.click(do_dict, outputs=status)
+    web_btn.click(do_web, outputs=status)
     demo.load(refresh_status, outputs=status)
 
     # periodic status refresh (not true polling inside gradio, use change hook via demo load only)
