@@ -1,7 +1,0 @@
-[
-  {
-    "name": "reverse_a_string",
-    "description": "reverse a string",
-    "code": "def run(input_text):\n    return input_text[::-1]"
-  }
-]

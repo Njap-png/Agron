@@ -1013,6 +1013,61 @@ def learn_from_scratch_memory():
         TRAIN_LOCK.release()
 
 
+
+FACTORY_RESET_PATHS = ["/content/agron-model", "/content/agron-learned", "/content/agron-web", "/content/agron-dictionary", "/content/agron-from-scratch-memory", "/content/agron-scratch-small"]
+
+
+def factory_reset():
+    global MODEL, interactions, learned_topics
+    stop_self_evolution()
+    with IO_LOCK:
+        interactions = []
+        learned_topics = []
+        try:
+            os.makedirs(MEMORY_DIR, exist_ok=True)
+            open(INTERACTIONS_FILE, "w").close()
+            json.dump([], open(TOPICS_FILE, "w"))
+        except Exception:
+            pass
+        # clear tools registry
+        try:
+            if os.path.exists(TOOLS_FILE):
+                os.remove(TOOLS_FILE)
+        except Exception:
+            pass
+        for tn in list(TOOL_REGISTRY.keys()):
+            if not TOOL_REGISTRY[tn].get("builtin"):
+                del TOOL_REGISTRY[tn]
+        # clear scratch corpus
+        try:
+            sc = os.path.join(MEMORY_DIR, "scratch_corpus.txt")
+            if os.path.exists(sc):
+                os.remove(sc)
+        except Exception:
+            pass
+    # delete trained model dirs
+    import shutil
+    for d in FACTORY_RESET_PATHS:
+        if os.path.exists(d):
+            shutil.rmtree(d, ignore_errors=True)
+    # reinitialize Agron base model with fresh random weights (no pretrained load)
+    try:
+        from transformers import LlamaConfig, LlamaForCausalLM
+        cfg = LlamaConfig(vocab_size=16384, hidden_size=512, intermediate_size=2048, num_hidden_layers=8, num_attention_heads=4, num_key_value_heads=4, max_position_embeddings=512, bos_token_id=0, eos_token_id=2, pad_token_id=1, tie_word_embeddings=False)
+        MODEL = LlamaForCausalLM(cfg)
+        if torch.cuda.is_available():
+            MODEL = MODEL.to("cuda")
+        MODEL.eval()
+    except Exception as e:
+        training_state["last"] = f"reset model error: {str(e)[:120]}"
+    LAST = globals().get("LAST_TRAIN_TIME", 0.0)
+    globals()["LAST_TRAIN_TIME"] = time.time()
+    training_state["running"] = False
+    training_state["steps"] = 0
+    training_state["last"] = "factory reset complete - fresh base model initialized"
+    return "factory reset complete"
+
+
 with gr.Blocks(title="Agron Neural Interface") as demo:
     gr.HTML(PARTICLE_HTML, js_on_load=PARTICLE_JS)
     gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>", elem_classes="agron-card")
@@ -1054,6 +1109,7 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
                 evolve_btn = gr.Button("Start self-evolution")
                 stop_evolve_btn = gr.Button("Stop")
             update_btn = gr.Button("Self-update")
+            reset_btn = gr.Button("Factory reset")
 
     def respond(message, history):
         if not message.strip():
@@ -1121,6 +1177,7 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
     evolve_btn.click(do_evolve, outputs=status)
     stop_evolve_btn.click(do_stop_evolve, outputs=status)
     update_btn.click(do_update, outputs=status)
+    reset_btn.click(factory_reset, outputs=status)
     demo.load(refresh_status, outputs=status)
 
     # periodic status refresh (not true polling inside gradio, use change hook via demo load only)
