@@ -1,0 +1,43 @@
+name: Sync to Hugging Face
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+      - name: Set up Git LFS
+        run: git lfs install
+      - name: Configure Git
+        run: |
+          git config user.name "Njap-png"
+          git config user.email "teddy.njagi.w@gmail.com"
+      - name: Add HF remote
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git remote add hf "https://teddyoas:${HF_TOKEN}@huggingface.co/teddyoas/Agron.git"
+      - name: Fetch HF
+        run: git fetch hf main
+      - name: Merge HF changes if needed
+        run: |
+          if ! git merge-base --is-ancestor hf/main HEAD; then
+            git merge --no-edit hf/main
+          fi
+      - name: Push LFS objects to HF
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: git lfs push hf --all
+      - name: Push to HF
+        run: git push hf HEAD:main

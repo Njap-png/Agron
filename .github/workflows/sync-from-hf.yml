@@ -1,0 +1,45 @@
+name: Sync from Hugging Face
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  repository_dispatch:
+    types: [hf-updated]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+      - name: Set up Git LFS
+        run: git lfs install
+      - name: Configure Git
+        run: |
+          git config user.name "Njap-png"
+          git config user.email "teddy.njagi.w@gmail.com"
+      - name: Add HF remote
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git remote add hf "https://teddyoas:${HF_TOKEN}@huggingface.co/teddyoas/Agron.git"
+      - name: Fetch HF
+        run: git fetch hf main
+      - name: Merge if HF is ahead
+        run: |
+          if git merge-base --is-ancestor hf/main HEAD; then
+            echo "Already up to date"
+            exit 0
+          fi
+          git merge --no-edit hf/main
+      - name: Push LFS objects to GitHub
+        run: git lfs push origin --all || true
+      - name: Push to GitHub
+        run: git push origin HEAD:main
