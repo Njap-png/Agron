@@ -449,22 +449,79 @@ def fetch_word_list(limit=500):
 
 
 def fetch_definition(word):
+    UA = "AgronBot/1.0 (teddy.njagi.w@gmail.com)"
+    # Try Wiktionary extract
     try:
-        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
-        with urllib.request.urlopen(url, timeout=20) as r:
-            data = json.loads(r.read().decode())
-        meanings = data[0].get("meanings", [])
-        for m in meanings:
-            for d in m.get("definitions", []):
-                if d.get("definition"):
-                    ex = d.get("example")
-                    txt = f"{word}: {d['definition']}"
-                    if ex:
-                        txt += f" Example: {ex}"
-                    return txt
+        r = requests.get("https://en.wiktionary.org/w/api.php", params={
+            "action": "query", "prop": "extracts", "explaintext": "1",
+            "titles": word, "format": "json"
+        }, headers={"User-Agent": UA}, timeout=20)
+        if r.status_code == 200:
+            page = list(r.json().get("query", {}).get("pages", {}).values())
+            if page:
+                extract = page[0].get("extract", "")
+                if extract:
+                    meaning = _parse_wiktionary(extract)
+                    if meaning:
+                        return f"{word}: {meaning}"
     except Exception:
-        return None
+        pass
+    # Try Wikipedia summary
+    try:
+        r = requests.get("https://en.wikipedia.org/api/rest_v1/page/summary/" + word, headers={"User-Agent": UA}, timeout=20)
+        if r.status_code == 200:
+            ex = r.json().get("extract", "")
+            if ex and len(ex) > 20:
+                return f"{word}: {ex.split('.')[0]}."
+    except Exception:
+        pass
+    # Fallback: ask local voice model
+    try:
+        if VOICE_MODEL is not None and VOICE_TOK is not None:
+            msgs = [{"role": "system", "content": "You are a dictionary. Reply with a single concise definition for the given word, no extra text."},
+                    {"role": "user", "content": f"Define: {word}"}]
+            prompt = VOICE_TOK.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            inputs = VOICE_TOK(prompt, return_tensors="pt").to(VOICE_MODEL.device)
+            with torch.no_grad():
+                out = VOICE_MODEL.generate(**inputs, max_new_tokens=40, do_sample=False)
+            txt = VOICE_TOK.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+            if txt and len(txt) > 8:
+                return f"{word}: {txt.split(chr(10))[0]}"
+    except Exception:
+        pass
     return None
+
+
+def _parse_wiktionary(extract):
+    lines = [ln.strip() for ln in extract.splitlines()]
+    # find section headers for parts of speech
+    for i, ln in enumerate(lines):
+        if ln.startswith("===") and ln.endswith("==="):
+            title = ln.strip("=").strip().lower()
+            if title in {"noun", "verb", "adjective", "adverb", "pronoun", "preposition"}:
+                # take next non-empty, non-heading line
+                for j in range(i+1, min(i+12, len(lines))):
+                    cand = lines[j]
+                    if not cand or cand.startswith("===") or cand.startswith("===="):
+                        continue
+                    cand2 = cand.lstrip("#*:- ").strip()
+                    if len(cand2) <= 8:
+                        continue
+                    lowc = cand2.lower()
+                    if "plural" in lowc or lowc.startswith(word.lower()):
+                        continue
+                    if lowc.startswith("synonym") or lowc.startswith("see thesaurus"):
+                        continue
+                    return cand2
+    # fallback: first long line not a header
+    for ln in lines:
+        if not ln or ln.startswith("===") or ln.startswith("=="):
+            continue
+        cand = ln.lstrip("#*:- ").strip()
+        if len(cand) > 12:
+            return cand
+    return None
+
 
 
 def learn_dictionary():
@@ -474,7 +531,7 @@ def learn_dictionary():
     training_state["running"] = True
     training_state["last"] = "fetching dictionary..."
     try:
-        words = fetch_word_list(400)
+        words = fetch_word_list(150)
         if not words:
             raise RuntimeError("could not fetch word list")
         lines = []
@@ -658,6 +715,71 @@ def learn_web(topic):
         TRAIN_LOCK.release()
 
 
+EVOLVE_STATE = {"running": False, "cycles": 0, "last_topic": "none"}
+
+
+def self_update():
+    try:
+        subprocess.run(["git", "-C", ROOT, "fetch", "origin"], check=True, timeout=60)
+        local = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        remote = subprocess.run(["git", "-C", ROOT, "rev-parse", "origin/main"], capture_output=True, text=True, check=True).stdout.strip()
+        if local != remote:
+            subprocess.run(["git", "-C", ROOT, "pull", "--ff-only", "origin", "main"], check=True, timeout=300)
+            return "updated from GitHub; restart app to apply new code"
+        return "already up to date"
+    except Exception as e:
+        return f"update error: {str(e)[:120]}"
+
+
+EVOLVE_TOPICS = [
+    "artificial intelligence self improvement",
+    "plant design software PDMS",
+    "machine learning transformers",
+    "python programming best practices",
+    "data structures algorithms",
+    "neural network training techniques",
+    "encyclopedia general knowledge",
+]
+
+
+def _self_evolve_worker():
+    EVOLVE_STATE["running"] = True
+    i = 0
+    try:
+        while EVOLVE_STATE["running"]:
+            # evolve from conversations if enough
+            if len(interactions) >= 4:
+                learn_from_interactions()
+            # learn from web on rotating topics
+            if EVOLVE_STATE["running"]:
+                topic = EVOLVE_TOPICS[i % len(EVOLVE_TOPICS)]
+                i += 1
+                EVOLVE_STATE["last_topic"] = topic
+                learn_web(topic)
+            EVOLVE_STATE["cycles"] += 1
+            # downtime before next cycle
+            for _ in range(300):
+                if not EVOLVE_STATE["running"]:
+                    break
+                time.sleep(1)
+    except Exception as e:
+        training_state["last"] = f"evolve error: {str(e)[:120]}"
+    finally:
+        EVOLVE_STATE["running"] = False
+
+
+def start_self_evolution():
+    if EVOLVE_STATE["running"]:
+        return "self-evolution already running"
+    threading.Thread(target=_self_evolve_worker, daemon=True).start()
+    return "self-evolution started"
+
+
+def stop_self_evolution():
+    EVOLVE_STATE["running"] = False
+    return "stopping self-evolution..."
+
+
 with gr.Blocks(title="Agron Neural Interface") as demo:
     gr.HTML(PARTICLE_HTML, js_on_load=PARTICLE_JS)
     gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>", elem_classes="agron-card")
@@ -677,6 +799,10 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
             dict_btn = gr.Button("Learn dictionary words")
             web_topic = gr.Textbox(label="Web topic / search query", placeholder="e.g. transformer architecture", lines=1)
             web_btn = gr.Button("Search & learn web")
+            with gr.Row():
+                evolve_btn = gr.Button("Start self-evolution")
+                stop_evolve_btn = gr.Button("Stop")
+            update_btn = gr.Button("Self-update")
             gr.Markdown("### Network metrics")
             metrics = gr.Textbox(value="nodes: 130 · mesh: active · LFS: ok", label="Diagnostics", interactive=False)
 
@@ -696,7 +822,7 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
         return "training started in background..."
 
     def refresh_status():
-        return f"interactions: {len(interactions)} | running={training_state['running']} | {training_state['last']}"
+        return f"interactions: {len(interactions)} | running={training_state['running']} | cycles={EVOLVE_STATE['cycles']} | {training_state['last']}"
 
     send.click(respond, [msg, chatbot], [chatbot, msg])
     msg.submit(respond, [msg, chatbot], [chatbot, msg])
@@ -718,6 +844,15 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
     learn_btn.click(do_learn, outputs=status)
     dict_btn.click(do_dict, outputs=status)
     web_btn.click(do_web, outputs=status)
+    def do_evolve():
+        return start_self_evolution()
+    def do_stop_evolve():
+        return stop_self_evolution()
+    def do_update():
+        return self_update()
+    evolve_btn.click(do_evolve, outputs=status)
+    stop_evolve_btn.click(do_stop_evolve, outputs=status)
+    update_btn.click(do_update, outputs=status)
     demo.load(refresh_status, outputs=status)
 
     # periodic status refresh (not true polling inside gradio, use change hook via demo load only)
