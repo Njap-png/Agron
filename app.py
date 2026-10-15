@@ -104,6 +104,20 @@ def build_model():
 TOKENIZER = build_tokenizer()
 MODEL, DEVICE = build_model()
 load_interactions()
+
+VOICE_ID = "Qwen/Qwen2.5-3B-Instruct"
+VOICE_TOK = None
+VOICE_MODEL = None
+try:
+    from transformers import AutoTokenizer as _ATok, AutoModelForCausalLM as _AModel
+    VOICE_TOK = _ATok.from_pretrained(VOICE_ID)
+    VOICE_MODEL = _AModel.from_pretrained(VOICE_ID, dtype=__import__("torch").float16, device_map="auto")
+    VOICE_MODEL.eval()
+    print("Voice model loaded:", VOICE_ID)
+except Exception as _ve:
+    print("Voice model failed to load:", _ve)
+    VOICE_TOK = None
+    VOICE_MODEL = None
 load_topics()
 if not learned_topics:
     learned_topics.append("base text model (WikiText-2)")
@@ -207,30 +221,54 @@ def generate_response(message, history):
         response = "I've learned from you and my training sources: " + "; ".join(parts) + "."
         persist_interaction({"ts": __import__("time").time(), "user": message, "assistant": response})
         return response
-    prompt = _build_prompt(message, history)
-    with IO_LOCK:
-        inputs = TOKENIZER(prompt, return_tensors="pt").to(DEVICE)
-        input_len = inputs.input_ids.shape[1]
-        with torch.no_grad():
-            output = MODEL.generate(
-                **inputs,
-                max_new_tokens=DEFAULT_MAX_NEW,
-                do_sample=True,
-                temperature=DEFAULT_TEMP,
-                top_p=DEFAULT_TOP_P,
-                pad_token_id=1,
-                eos_token_id=2,
-                repetition_penalty=1.4,
-                no_repeat_ngram_size=3,
-                top_k=40,
-            )
-        new_tokens = output[0][input_len:]
-        response = TOKENIZER.decode(new_tokens, skip_special_tokens=True).strip()
-        for stop in ["\n\n", "User:", "user:"]:
-            if stop in response:
-                response = response.split(stop)[0].strip()
-        import re
-        response = re.sub(r"(.{6,})\1{2,}", r"\1", response).strip()
+    if VOICE_MODEL is not None:
+        mem_lines = [f"User: {r['user']}\nAgron: {r['assistant']}" for r in interactions[-3:]]
+        mem_ctx = "\n".join(mem_lines)
+        user_content = message
+        if mem_ctx:
+            user_content = f"Relevant memory:\n{mem_ctx}\n\nUser: {message}"
+        _msgs = [
+            {"role": "system", "content": "You are Agron, a helpful, warm, knowledgeable AI assistant. Speak naturally and concisely. If unsure, say so and suggest 'Search & learn web'."},
+            {"role": "user", "content": user_content},
+        ]
+        _prompt = VOICE_TOK.apply_chat_template(_msgs, tokenize=False, add_generation_prompt=True)
+        with IO_LOCK:
+            _inputs = VOICE_TOK(_prompt, return_tensors="pt").to(VOICE_MODEL.device)
+            with torch.no_grad():
+                _out = VOICE_MODEL.generate(
+                    **_inputs,
+                    max_new_tokens=DEFAULT_MAX_NEW,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    repetition_penalty=1.15,
+                )
+            response = VOICE_TOK.decode(_out[0][_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+    else:
+        prompt = _build_prompt(message, history)
+        with IO_LOCK:
+            inputs = TOKENIZER(prompt, return_tensors="pt").to(DEVICE)
+            input_len = inputs.input_ids.shape[1]
+            with torch.no_grad():
+                output = MODEL.generate(
+                    **inputs,
+                    max_new_tokens=DEFAULT_MAX_NEW,
+                    do_sample=True,
+                    temperature=DEFAULT_TEMP,
+                    top_p=DEFAULT_TOP_P,
+                    pad_token_id=1,
+                    eos_token_id=2,
+                    repetition_penalty=1.4,
+                    no_repeat_ngram_size=3,
+                    top_k=40,
+                )
+            new_tokens = output[0][input_len:]
+            response = TOKENIZER.decode(new_tokens, skip_special_tokens=True).strip()
+            for stop in ["\n\n", "User:", "user:"]:
+                if stop in response:
+                    response = response.split(stop)[0].strip()
+            import re
+            response = re.sub(r"(.{6,})\1{2,}", r"\1", response).strip()
     if is_bad_response(response):
         sw = safe_web_answer(message)
         response = sw if sw else "I'm not sure. Could you rephrase, or use 'Search & learn web' to teach me."
