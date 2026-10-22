@@ -18,6 +18,35 @@ MEMORY_DIR = os.path.join(ROOT, "memory")
 INTERACTIONS_FILE = os.path.join(MEMORY_DIR, "interactions.jsonl")
 os.makedirs(MEMORY_DIR, exist_ok=True)
 
+
+def _pick_work_dir():
+    """Writable scratch dir for training artifacts (works on HF Spaces where /content may not exist)."""
+    candidates = [os.environ.get("AGRON_WORK_DIR"), "/content", os.path.join(ROOT, "workspace")]
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            os.makedirs(cand, exist_ok=True)
+            probe = os.path.join(cand, ".agron_write_probe")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+            return cand
+        except Exception:
+            continue
+    return ROOT
+
+
+WORK_DIR = _pick_work_dir()
+
+# Deployment / runtime configuration
+VOICE_MODEL_ID = os.environ.get("AGRON_VOICE_MODEL", "Qwen/Qwen2.5-3B-Instruct")
+USE_VOICE = os.environ.get("AGRON_USE_VOICE", "1").strip().lower() not in ("0", "false", "no")
+AUTO_PUSH = os.environ.get("AGRON_AUTO_PUSH", "1").strip().lower() not in ("0", "false", "no")
+SERVER_PORT = int(os.environ.get("AGRON_PORT", "7860"))
+SERVER_NAME = os.environ.get("AGRON_HOST", "0.0.0.0")
+SHARE = os.environ.get("AGRON_SHARE", "0").strip().lower() in ("1", "true", "yes")
+
 IO_LOCK = threading.Lock()
 TRAIN_LOCK = threading.Lock()
 
@@ -38,6 +67,31 @@ def load_interactions():
                         interactions.append(json.loads(line))
                     except Exception:
                         pass
+
+
+def git_auto_push(message, paths):
+    """Stage `paths`, commit and push to origin (Hugging Face). Returns (ok, detail)."""
+    if not AUTO_PUSH:
+        return False, "auto-push disabled (AGRON_AUTO_PUSH=0)"
+    try:
+        for p in paths:
+            subprocess.run(["git", "-C", ROOT, "add", p], check=False)
+        status = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        if not status:
+            return True, "no changes to push"
+        # make sure a committer identity exists (Spaces do not ship one)
+        for key, val in (("user.name", "Agron"), ("user.email", "agron@users.noreply.huggingface.co")):
+            if not subprocess.run(["git", "-C", ROOT, "config", "--get", key],
+                                  capture_output=True, text=True).stdout.strip():
+                subprocess.run(["git", "-C", ROOT, "config", key, val], check=False)
+        branch = subprocess.run(["git", "-C", ROOT, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True).stdout.strip() or "main"
+        subprocess.run(["git", "-C", ROOT, "commit", "-m", message], check=True)
+        subprocess.run(["git", "-C", ROOT, "push", "origin", f"HEAD:{branch}"], check=True)
+        return True, f"pushed to Hugging Face ({branch})"
+    except Exception as e:
+        return False, f"push error: {str(e)[:150]}"
 
 
 TOPICS_FILE = os.path.join(MEMORY_DIR, "learned_topics.json")
@@ -109,19 +163,23 @@ TOKENIZER = build_tokenizer()
 MODEL, DEVICE = build_model()
 load_interactions()
 
-VOICE_ID = "Qwen/Qwen2.5-3B-Instruct"
+VOICE_ID = VOICE_MODEL_ID
 VOICE_TOK = None
 VOICE_MODEL = None
-try:
-    from transformers import AutoTokenizer as _ATok, AutoModelForCausalLM as _AModel
-    VOICE_TOK = _ATok.from_pretrained(VOICE_ID)
-    VOICE_MODEL = _AModel.from_pretrained(VOICE_ID, dtype=__import__("torch").float16, device_map="auto")
-    VOICE_MODEL.eval()
-    print("Voice model loaded:", VOICE_ID)
-except Exception as _ve:
-    print("Voice model failed to load:", _ve)
-    VOICE_TOK = None
-    VOICE_MODEL = None
+if USE_VOICE:
+    try:
+        from transformers import AutoTokenizer as _ATok, AutoModelForCausalLM as _AModel
+        print("Loading voice model:", VOICE_ID)
+        VOICE_TOK = _ATok.from_pretrained(VOICE_ID)
+        VOICE_MODEL = _AModel.from_pretrained(VOICE_ID, dtype=__import__("torch").float16, device_map="auto")
+        VOICE_MODEL.eval()
+        print("Voice model loaded:", VOICE_ID)
+    except Exception as _ve:
+        print("Voice model failed to load:", _ve)
+        VOICE_TOK = None
+        VOICE_MODEL = None
+else:
+    print("Voice model disabled (AGRON_USE_VOICE=0) - using the native Agron base model")
 load_topics()
 if not learned_topics:
     learned_topics.append("base text model (WikiText-2)")
@@ -187,16 +245,21 @@ def is_bad_response(text):
 
 
 def safe_web_answer(query):
+    """Grounded answer built from live search results (used when the model's own reply is unusable)."""
     try:
         results = web_search(query, 3)
-        if results:
-            sn = (results[0].get("snippet") or "").strip()
-            if len(sn) >= 20:
-                return f"{sn} (source: {results[0]['title']})"
-            # try crawl
-            page = crawl_page(results[0]["url"])
-            if page:
-                return f"{page[:300]}... (source: {results[0]['title']})"
+        if not results:
+            return None
+        lines = []
+        for i, r in enumerate(results):
+            sn = (r.get("snippet") or "").strip()
+            if len(sn) < 20:
+                page = crawl_page(r["url"])
+                sn = (page[:300] + "...") if page else sn
+            if not sn:
+                continue
+            lines.append(f"{i + 1}. {r['title']} — {sn} ({r['url']})")
+        return "\n".join(lines) if lines else None
     except Exception:
         pass
     return None
@@ -237,15 +300,18 @@ def generate_response(message, history):
         response = "I've learned from you and my training sources: " + "; ".join(parts) + "."
         persist_interaction({"ts": __import__("time").time(), "user": message, "assistant": response})
         return response
+    # Live web context is only useful for the voice model; the base model path falls
+    # back to a grounded search answer only when its own reply is unusable.
     _web_ctx = ""
-    try:
-        if len(message.strip()) >= 4:
-            _res = web_search(message, 3)
-            _lines = [f"- {r['title']}: {r.get('snippet','')}" for r in _res if (r.get('snippet') or '').strip()]
-            if _lines:
-                _web_ctx = "Web search results (live):\n" + "\n".join(_lines[:3])
-    except Exception:
-        _web_ctx = ""
+    if VOICE_MODEL is not None:
+        try:
+            if len(message.strip()) >= 4:
+                _res = web_search(message, 3)
+                _lines = [f"- {r['title']}: {r.get('snippet','')}" for r in _res if (r.get('snippet') or '').strip()]
+                if _lines:
+                    _web_ctx = "Web search results (live):\n" + "\n".join(_lines[:3])
+        except Exception:
+            _web_ctx = ""
     if VOICE_MODEL is not None:
         mem_lines = [f"User: {r['user']}\nAgron: {r['assistant']}" for r in interactions[-3:]]
         mem_ctx = "\n".join(mem_lines)
@@ -330,7 +396,7 @@ def learn_from_interactions():
             pad = [TOKENIZER.pad_token_id] * (block - len(toks))
             chunks = [toks + pad]
         ds = Dataset.from_dict({"input_ids": chunks, "labels": [c[:] for c in chunks]})
-        out_dir = os.path.join("/content", "agron-learned")
+        out_dir = os.path.join(WORK_DIR, "agron-learned")
         os.makedirs(out_dir, exist_ok=True)
         args = TrainingArguments(
             output_dir=out_dir,
@@ -358,18 +424,16 @@ def learn_from_interactions():
         shutil.copyfile(os.path.join(out_dir, "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
         training_state["steps"] += 30
         training_state["count_at_train"] = len(interactions)
-        # auto-push to GitHub (triggers HF sync workflow)
+        # auto-push the re-trained weights + memory to Hugging Face
         try:
-            subprocess.run(["git", "-C", ROOT, "add", "model.safetensors"], check=True)
-            subprocess.run(["git", "-C", ROOT, "add", "memory/interactions.jsonl"], check=False)
-            status = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
-            if status:
-                subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron auto-learn ({len(interactions)} interactions)"], check=True)
-                subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+            ok, detail = git_auto_push(
+                f"Agron auto-learn ({len(interactions)} interactions)",
+                ["model.safetensors", "memory/interactions.jsonl"],
+            )
             if "conversation memory" not in learned_topics:
                 learned_topics.append("conversation memory")
             persist_topics()
-            training_state["last"] = f"learned & pushed @ {len(interactions)} interactions"
+            training_state["last"] = f"learned · {detail} @ {len(interactions)} interactions"
         except Exception as pe:
             training_state["last"] = f"push error: {str(pe)[:150]}"
     except Exception as e:
@@ -387,18 +451,16 @@ def chat_fn(message, history):
 PARTICLE_HTML = r"""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=VT323&display=swap');
-  html, body { margin: 0 !important; height: 100vh !important; overflow: hidden !important; background: radial-gradient(1200px 800px at 50% 40%, #0a1a3a 0%, #020617 70%) !important; color: #e2e8f0 !important; font-family: "Segoe UI", "Orbitron", monospace !important; }
+  html, body {
+    margin: 0 !important; min-height: 100vh !important; background: radial-gradient(1200px 800px at 50% 25%, #0a1a3a 0%, #020617 70%) !important;
+    color: #e2e8f0 !important; font-family: "Segoe UI", "Orbitron", monospace !important;
+  }
   body, .gradio-container, .app { background: transparent !important; position: relative; z-index: 1; }
   #agron-bg-canvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 0; }
   .gradio-container {
-    max-width: 100vw !important; height: 100vh !important; padding: 10px 14px !important; gap: 10px !important;
+    max-width: 1500px !important; margin: 0 auto !important; padding: 10px 14px 24px !important; gap: 10px !important;
     border: 1px solid rgba(34, 211, 238, 0.4) !important;
     box-shadow: 0 0 40px rgba(34,211,238,0.25), inset 0 0 60px rgba(34,211,238,0.05) !important;
-  }
-  .gradio-container::before {
-    content: "AGRØN · NEURAL COMMAND HUD";
-    display: block; width: 100%; color: #22d3ee; text-shadow: 0 0 18px rgba(34,211,238,0.85);
-    font-family: "Orbitron", monospace; letter-spacing: 4px; font-size: 22px; font-weight: 700; text-align: center; padding-bottom: 6px;
   }
   body::after {
     content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
@@ -411,8 +473,11 @@ PARTICLE_HTML = r"""
     padding: 8px !important;
   }
   .agron-card h1, .agron-card h2, .agron-card h3 { color: #67e8f9; text-shadow: 0 0 8px rgba(34,211,238,0.5); font-family: "Orbitron","Segoe UI",sans-serif; letter-spacing: 2px; }
-  .agron-title { color: #67e8f9; text-shadow: 0 0 18px rgba(34,211,238,0.8); font-family: "Orbitron", "Segoe UI", sans-serif; letter-spacing: 2px; text-align: center; margin-bottom: 4px; text-transform: uppercase; }
-  .agron-sub { color: #a5f3fc; text-align: center; font-size: 12px; opacity: 0.8; margin-bottom: 12px; letter-spacing: 1px; }
+  .agron-title { color: #67e8f9; text-shadow: 0 0 18px rgba(34,211,238,0.8); font-family: "Orbitron", "Segoe UI", sans-serif; letter-spacing: 3px; text-align: center; margin-bottom: 2px; text-transform: uppercase; }
+  .agron-sub { color: #a5f3fc; text-align: center; font-size: 12px; opacity: 0.85; letter-spacing: 1px; }
+  .agron-head { border: 1px solid rgba(34,211,238,0.35) !important; background: rgba(8,20,45,0.5) !important; border-radius: 12px !important; padding: 6px 12px !important; }
+  .agron-strip textarea { color: #67e8f9 !important; background: rgba(2, 6, 23, 0.6) !important; font-family: "VT323", monospace !important; font-size: 15px !important; letter-spacing: 1px; }
+  .agron-log textarea { color: #a5f3fc !important; background: rgba(2, 6, 23, 0.6) !important; font-family: "VT323", monospace !important; font-size: 15px !important; }
   .status-box textarea { color: #67e8f9 !important; background: rgba(2, 6, 23, 0.6) !important; font-family: monospace !important; }
   .gradio-container input, .gradio-container textarea, .gradio-container select, .block {
     background: rgba(2, 6, 23, 0.55) !important; color: #e2e8f0 !important;
@@ -424,7 +489,14 @@ PARTICLE_HTML = r"""
   .gr-chatbot, .chatbot { background: rgba(2, 6, 23, 0.48) !important; border: 1px solid rgba(34, 211, 238, 0.35) !important; border-radius: 10px !important; }
   .markdown-text { font-family: "Segoe UI", "Orbitron", sans-serif !important; }
   .gr-group, .gr-row { min-height: 0 !important; }
-  footer, .foot, .contain { display: none !important; }
+  .tab-nav, .tabs > .tab-nav, [role="tablist"] { background: rgba(2,6,23,0.5) !important; border: 1px solid rgba(34,211,238,0.3) !important; border-radius: 10px !important; }
+  [role="tablist"] button { color: #94a3b8 !important; border: none !important; background: transparent !important; letter-spacing: 1px !important; text-transform: uppercase; font-size: 12px !important; }
+  [role="tablist"] button.selected { color: #22d3ee !important; background: rgba(34,211,238,0.14) !important; text-shadow: 0 0 10px rgba(34,211,238,0.8) !important; }
+  footer, .foot { display: none !important; }
+  @media (max-width: 1000px) {
+    .gradio-container { max-width: 100% !important; }
+    .gr-chatbot, .chatbot { height: 420px !important; }
+  }
 </style>
 <canvas id="agron-bg-canvas"></canvas>
 """
@@ -611,7 +683,7 @@ def learn_dictionary():
         if not chunks:
             chunks = [toks[:block] + [TOKENIZER.pad_token_id] * (block - min(block, len(toks)))]
         ds = Dataset.from_dict({"input_ids": chunks, "labels": [c[:] for c in chunks]})
-        out_dir = os.path.join("/content", "agron-dictionary")
+        out_dir = os.path.join(WORK_DIR, "agron-dictionary")
         os.makedirs(out_dir, exist_ok=True)
         args = TrainingArguments(
             output_dir=out_dir,
@@ -634,12 +706,11 @@ def learn_dictionary():
         shutil.copyfile(os.path.join(out_dir, "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
         # push
         training_state["last"] = "pushing dictionary model..."
-        subprocess.run(["git", "-C", ROOT, "add", "model.safetensors"], check=True)
-        subprocess.run(["git", "-C", ROOT, "add", "memory/interactions.jsonl"], check=False)
-        status = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
-        if status:
-            subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron dictionary learning ({len(lines)} words)"], check=True)
-            subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+        ok, detail = git_auto_push(
+            f"Agron dictionary learning ({len(lines)} words)",
+            ["model.safetensors", "memory/interactions.jsonl"],
+        )
+        training_state["last"] = f"dictionary learned · {detail}"
         learned_topics.append("dictionary words")
         persist_topics()
         training_state["last"] = f"dictionary learned & pushed ({len(lines)} words)"
@@ -737,7 +808,7 @@ def learn_web(topic):
         if not chunks:
             raise RuntimeError("not enough web text")
         ds = Dataset.from_dict({"input_ids": chunks, "labels": [c[:] for c in chunks]})
-        out_dir = os.path.join("/content", "agron-web")
+        out_dir = os.path.join(WORK_DIR, "agron-web")
         os.makedirs(out_dir, exist_ok=True)
         args = TrainingArguments(
             output_dir=out_dir,
@@ -759,15 +830,13 @@ def learn_web(topic):
         import shutil
         shutil.copyfile(os.path.join(out_dir, "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
         training_state["last"] = "pushing web-learned model..."
-        subprocess.run(["git", "-C", ROOT, "add", "model.safetensors"], check=True)
-        subprocess.run(["git", "-C", ROOT, "add", "memory/interactions.jsonl"], check=False)
-        status = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
-        if status:
-            subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron web learning: {topic}"], check=True)
-            subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+        ok, detail = git_auto_push(
+            f"Agron web learning: {topic}",
+            ["model.safetensors", "memory/interactions.jsonl"],
+        )
         learned_topics.append(f"web: {topic}")
         persist_topics()
-        training_state["last"] = f"web learned & pushed: {topic}"
+        training_state["last"] = f"web learned · {detail}: {topic}"
     except Exception as e:
         training_state["last"] = f"web error: {str(e)[:150]}"
     finally:
@@ -779,14 +848,19 @@ EVOLVE_STATE = {"running": False, "cycles": 0, "last_topic": "none"}
 
 
 def self_update():
+    """Pull the latest code from the Hugging Face repo (origin)."""
     try:
-        subprocess.run(["git", "-C", ROOT, "fetch", "origin"], check=True, timeout=60)
+        subprocess.run(["git", "-C", ROOT, "fetch", "origin"], check=True, timeout=120)
+        branch = subprocess.run(["git", "-C", ROOT, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True).stdout.strip() or "main"
         local = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-        remote = subprocess.run(["git", "-C", ROOT, "rev-parse", "origin/main"], capture_output=True, text=True, check=True).stdout.strip()
+        remote = subprocess.run(["git", "-C", ROOT, "rev-parse", f"origin/{branch}"], capture_output=True, text=True).stdout.strip()
+        if not remote:
+            return f"could not resolve origin/{branch}"
         if local != remote:
-            subprocess.run(["git", "-C", ROOT, "pull", "--ff-only", "origin", "main"], check=True, timeout=300)
-            return "updated from GitHub; restart app to apply new code"
-        return "already up to date"
+            subprocess.run(["git", "-C", ROOT, "pull", "--ff-only", "origin", branch], check=True, timeout=300)
+            return f"updated from Hugging Face ({local[:7]} -> {remote[:7]}); restart app to apply new code"
+        return "already up to date with Hugging Face"
     except Exception as e:
         return f"update error: {str(e)[:120]}"
 
@@ -942,7 +1016,8 @@ def list_tool_names():
 
 
 def create_tool_from_description(desc):
-    if not desc.strip():
+    desc = (desc or "").strip()
+    if not desc:
         return "Provide a tool description first."
     try:
         prompt = (
@@ -1009,7 +1084,7 @@ def learn_from_scratch_memory():
         lines = [f"User: {r['user']}\nAgron: {r['assistant']}" for r in interactions]
         with open(corpus, "w", encoding="utf-8") as f:
             f.write("\n\n".join(lines))
-        out_dir = "/content/agron-from-scratch-memory"
+        out_dir = os.path.join(WORK_DIR, "agron-from-scratch-memory")
         training_state["last"] = f"training from scratch on {len(interactions)} interactions..."
         subprocess.run([
             "python3", os.path.join(ROOT, "train_from_scratch.py"),
@@ -1029,14 +1104,12 @@ def learn_from_scratch_memory():
         learned_topics.append("from-scratch memory model")
         persist_topics()
         training_state["last"] = "self-updating from scratch..."
-        subprocess.run(["git", "-C", ROOT, "add", "model.safetensors", "memory/scratch_corpus.txt"], check=True)
-        subprocess.run(["git", "-C", ROOT, "add", "memory/learned_topics.json"], check=False)
-        status = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
-        if status:
-            subprocess.run(["git", "-C", ROOT, "commit", "-m", f"Agron from-scratch learning ({len(interactions)} interactions)"], check=True)
-            subprocess.run(["git", "-C", ROOT, "push", "origin", "main"], check=True)
+        ok, detail = git_auto_push(
+            f"Agron from-scratch learning ({len(interactions)} interactions)",
+            ["model.safetensors", "memory/scratch_corpus.txt", "memory/learned_topics.json"],
+        )
         LAST_TRAIN_TIME = time.time()
-        training_state["last"] = f"from-scratch learned & pushed ({len(interactions)} interactions)"
+        training_state["last"] = f"from-scratch learned · {detail} ({len(interactions)} interactions)"
     except Exception as e:
         training_state["last"] = f"from-scratch error: {str(e)[:200]}"
     finally:
@@ -1045,7 +1118,12 @@ def learn_from_scratch_memory():
 
 
 
-FACTORY_RESET_PATHS = ["/content/agron-model", "/content/agron-learned", "/content/agron-web", "/content/agron-dictionary", "/content/agron-from-scratch-memory", "/content/agron-scratch-small"]
+FACTORY_RESET_PATHS = [
+    os.path.join(WORK_DIR, n) for n in (
+        "agron-model", "agron-learned", "agron-web", "agron-dictionary",
+        "agron-from-scratch-memory", "agron-scratch-small", "agron-scratch-current",
+    )
+]
 
 
 def factory_reset():
@@ -1091,7 +1169,6 @@ def factory_reset():
         MODEL.eval()
     except Exception as e:
         training_state["last"] = f"reset model error: {str(e)[:120]}"
-    LAST = globals().get("LAST_TRAIN_TIME", 0.0)
     globals()["LAST_TRAIN_TIME"] = time.time()
     training_state["running"] = False
     training_state["steps"] = 0
@@ -1099,51 +1176,92 @@ def factory_reset():
     return "factory reset complete"
 
 
+# ---------- status helpers ----------
+ACTION_LOG = []
+
+
+def log_action(msg):
+    """Append a line to the action log and return the rendered log."""
+    ACTION_LOG.append(f"{time.strftime('%H:%M:%S')}  {msg}")
+    del ACTION_LOG[:-60]
+    return "\n".join(ACTION_LOG[-14:])
+
+
+def status_line():
+    return (
+        f"interactions: {len(interactions)}  ·  tools: {len(list_tool_names())}  ·  "
+        f"evolve cycles: {EVOLVE_STATE['cycles']}  ·  training: "
+        f"{'RUNNING' if training_state['running'] else 'idle'}  ·  {training_state['last']}"
+    )
+
+
+def system_snapshot():
+    try:
+        n_params = sum(p.numel() for p in MODEL.parameters())
+    except Exception:
+        n_params = 0
+    gpu = ""
+    if torch.cuda.is_available():
+        try:
+            gpu = f"  ·  gpu alloc {torch.cuda.memory_allocated() / 1e9:.2f} GB"
+        except Exception:
+            gpu = ""
+    voice = "on" if VOICE_MODEL is not None else "off"
+    return (
+        f"params: {n_params / 1e6:.1f}M  ·  device: {DEVICE}{gpu}  ·  voice model: {voice}\n"
+        f"work dir: {WORK_DIR}\n"
+        f"topics: {len(learned_topics)}  ·  auto-push: {'on' if AUTO_PUSH else 'off'}"
+    )
+
+
 with gr.Blocks(title="Agron Neural Interface") as demo:
     gr.HTML(PARTICLE_HTML, js_on_load=PARTICLE_JS)
-    gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>", elem_classes="agron-card")
-    gr.Markdown("<div class='agron-sub'>Self-improving multi-agent core · particles = live network · learning from every exchange</div>")
+
+    with gr.Column(elem_classes="agron-head"):
+        gr.Markdown("<h1 class='agron-title'>AGRØN NEURAL INTERFACE</h1>")
+        gr.Markdown("<div class='agron-sub'>Self-improving multi-agent core · learning from every exchange</div>")
+
+    with gr.Column(elem_classes="agron-card"):
+        status_strip = gr.Textbox(value=status_line(), label="TELEMETRY", interactive=False, elem_classes="agron-strip", lines=2)
+        action_log = gr.Textbox(value=log_action("Agron interface online."), label="ACTION LOG", interactive=False, elem_classes="agron-log", lines=4)
+
     with gr.Row():
-        with gr.Column(scale=1, elem_classes="agron-card"):
-            gr.Markdown("<h3 class='agron-title'>SYSTEM</h3>")
-            sys_status = gr.Textbox(value=f"status: {training_state['last']}", label="Status", interactive=False, elem_classes="status-box")
-            sys_inter = gr.Textbox(value=f"interactions: {len(interactions)}", label="Interactions", interactive=False)
-            sys_tools = gr.Textbox(value=f"tools: {len(list_tool_names())}", label="Tools", interactive=False)
-            sys_cycles = gr.Textbox(value=f"evolve cycles: {EVOLVE_STATE['cycles']}", label="Evolution", interactive=False)
         with gr.Column(scale=4, elem_classes="agron-card"):
             gr.Markdown("<h2 class='agron-title'>💬 COMMAND CONSOLE</h2>")
-            chatbot = gr.Chatbot(height=460, label="Agron")
+            chatbot = gr.Chatbot(height=480, label="Agron", elem_classes="agron-chat")
             msg = gr.Textbox(placeholder="Speak to Agron...", label="Input", lines=2)
             with gr.Row():
                 send = gr.Button("Transmit", variant="primary")
                 clear = gr.Button("Clear")
-            gr.Markdown("⚙ auto decoding · high cap · focused")
         with gr.Column(scale=2, elem_classes="agron-card"):
-            gr.Markdown("<h2 class='agron-title'>📊 SYSTEM DASHBOARD</h2>")
-            status = gr.Textbox(value=f"interactions: {len(interactions)} | {training_state['last']}", label="Learning", interactive=False, elem_classes="status-box")
-            metrics = gr.Textbox(value=f"tools: {len(list_tool_names())} · cycles: {EVOLVE_STATE['cycles']} · nodes: 130", label="Diagnostics", interactive=False)
-            gr.Markdown("### Tools")
-            tool_dd = gr.Dropdown(choices=list_tool_names(), value=(list_tool_names()[0] if list_tool_names() else None), label="Select tool")
-            tool_in = gr.Textbox(placeholder="Tool input...", label="Tool input", lines=1)
-            tool_btn = gr.Button("Run tool")
-            tool_out = gr.Textbox(label="Tool output", interactive=False, lines=6)
-            gr.Markdown("### Create tool")
-            tool_desc = gr.Textbox(placeholder="Describe a new tool (pure computation)...", label="New tool description", lines=2)
-            create_btn = gr.Button("Create tool")
-            gr.Markdown("### Learning controls")
-            learn_btn = gr.Button("Train now on memory")
-            scratch_btn = gr.Button("Train from scratch (no fine-tune)")
-            dict_btn = gr.Button("Learn dictionary words")
-            web_topic = gr.Textbox(label="Web topic / search query", placeholder="e.g. transformer architecture", lines=1)
-            web_btn = gr.Button("Search & learn web")
-            with gr.Row():
-                evolve_btn = gr.Button("Start self-evolution")
-                stop_evolve_btn = gr.Button("Stop")
-            update_btn = gr.Button("Self-update")
-            reset_btn = gr.Button("Factory reset")
+            with gr.Tabs():
+                with gr.Tab("SYSTEM"):
+                    sys_status = gr.Textbox(value=training_state["last"], label="Pipeline", interactive=False, elem_classes="status-box", lines=2)
+                    metrics = gr.Textbox(value=system_snapshot(), label="Diagnostics", interactive=False, lines=4)
+                with gr.Tab("TOOLS"):
+                    tool_dd = gr.Dropdown(choices=list_tool_names(), value=(list_tool_names()[0] if list_tool_names() else None), label="Select tool")
+                    tool_in = gr.Textbox(placeholder="Tool input...", label="Tool input", lines=1)
+                    tool_btn = gr.Button("Run tool")
+                    tool_out = gr.Textbox(label="Tool output", interactive=False, lines=8)
+                    gr.Markdown("### Create tool")
+                    tool_desc = gr.Textbox(placeholder="Describe a new tool (pure computation)...", label="New tool description", lines=2)
+                    create_btn = gr.Button("Create tool")
+                with gr.Tab("LEARNING"):
+                    learn_btn = gr.Button("Train now on memory")
+                    scratch_btn = gr.Button("Train from scratch (no fine-tune)")
+                    dict_btn = gr.Button("Learn dictionary words")
+                    web_topic = gr.Textbox(label="Web topic / search query", placeholder="e.g. transformer architecture", lines=1)
+                    web_btn = gr.Button("Search & learn web")
+                    with gr.Row():
+                        evolve_btn = gr.Button("Start self-evolution")
+                        stop_evolve_btn = gr.Button("Stop")
+                    with gr.Row():
+                        update_btn = gr.Button("Self-update")
+                        reset_btn = gr.Button("Factory reset")
 
     def respond(message, history):
-        if not message.strip():
+        message = (message or "").strip()
+        if not message:
             return history, ""
         response = generate_response(message, history)
         history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": response}]
@@ -1151,68 +1269,68 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
 
     def do_learn():
         if training_state["running"]:
-            return f"training already running · {training_state['last']}"
+            return log_action(f"training already running · {training_state['last']}")
         if len(interactions) < 2:
-            return f"need at least 2 interactions (have {len(interactions)})"
+            return log_action(f"need at least 2 interactions (have {len(interactions)})")
         threading.Thread(target=learn_from_interactions, daemon=True).start()
-        return "training started in background..."
+        return log_action("memory training started in background")
 
     def refresh_status():
-        return f"interactions: {len(interactions)} | running={training_state['running']} | cycles={EVOLVE_STATE['cycles']} | {training_state['last']}"
+        return status_line(), training_state["last"], system_snapshot()
 
     send.click(respond, [msg, chatbot], [chatbot, msg])
     msg.submit(respond, [msg, chatbot], [chatbot, msg])
     clear.click(lambda: ([], ""), outputs=[chatbot, msg])
     def do_dict():
         if training_state["running"]:
-            return "training already running"
+            return log_action("training already running")
         threading.Thread(target=learn_dictionary, daemon=True).start()
-        return "dictionary learning started in background..."
+        return log_action("dictionary learning started in background")
 
     def do_web():
         if training_state["running"]:
-            return "training already running"
-        q = web_topic.value.strip()
+            return log_action("training already running")
+        q = (web_topic.value or "").strip()
         if not q:
-            return "enter a topic/query first"
+            return log_action("enter a topic/query first")
         threading.Thread(target=learn_web, args=(q,), daemon=True).start()
-        return f"web learning started: {q}"
+        return log_action(f"web learning started: {q}")
     def run_tool_fn(tool_name, tool_input):
         if not tool_name:
             return "select a tool first"
         return execute_tool(tool_name, tool_input or "")
     def create_tool_fn(desc):
-        return create_tool_from_description(desc)
+        return log_action(create_tool_from_description(desc))
     def refresh_tools():
         choices = list_tool_names()
         return gr.Dropdown(choices=choices, value=(choices[0] if choices else None))
     tool_btn.click(run_tool_fn, [tool_dd, tool_in], tool_out)
-    create_btn.click(create_tool_fn, tool_desc, status)
-    learn_btn.click(do_learn, outputs=status)
+    create_btn.click(create_tool_fn, tool_desc, action_log)
+    learn_btn.click(do_learn, outputs=action_log)
     def do_scratch():
         if training_state["running"]:
-            return "training already running"
+            return log_action("training already running")
         if len(interactions) < 6:
-            return f"need at least 6 interactions (have {len(interactions)})"
+            return log_action(f"need at least 6 interactions (have {len(interactions)})")
         threading.Thread(target=learn_from_scratch_memory, daemon=True).start()
-        return "from-scratch training started in background..."
-    scratch_btn.click(do_scratch, outputs=status)
-    dict_btn.click(do_dict, outputs=status)
-    web_btn.click(do_web, outputs=status)
+        return log_action("from-scratch training started in background")
+    scratch_btn.click(do_scratch, outputs=action_log)
+    dict_btn.click(do_dict, outputs=action_log)
+    web_btn.click(do_web, outputs=action_log)
     def do_evolve():
-        return start_self_evolution()
+        return log_action(start_self_evolution())
     def do_stop_evolve():
-        return stop_self_evolution()
+        return log_action(stop_self_evolution())
     def do_update():
-        return self_update()
-    evolve_btn.click(do_evolve, outputs=status)
-    stop_evolve_btn.click(do_stop_evolve, outputs=status)
-    update_btn.click(do_update, outputs=status)
-    reset_btn.click(factory_reset, outputs=status)
-    demo.load(refresh_status, outputs=status)
+        return log_action(self_update())
+    evolve_btn.click(do_evolve, outputs=action_log)
+    stop_evolve_btn.click(do_stop_evolve, outputs=action_log)
+    update_btn.click(do_update, outputs=action_log)
+    reset_btn.click(lambda: log_action(factory_reset()), outputs=action_log)
+    demo.load(refresh_status, outputs=[status_strip, sys_status, metrics])
 
     # periodic status refresh (not true polling inside gradio, use change hook via demo load only)
-    gr.Timer(5).tick(refresh_status, outputs=status)
+    gr.Timer(5).tick(refresh_status, outputs=[status_strip, sys_status, metrics])
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
+    demo.launch(server_name=SERVER_NAME, server_port=SERVER_PORT, share=SHARE, show_error=True)

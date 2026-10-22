@@ -64,9 +64,34 @@ Agron can push validated improvements to:
 
 ## Trained LLM
 
-Agron's initial LLM has now been trained **from scratch** on WikiText-2 using a 4-layer, 256-dim, 4-head LLaMA-style architecture (about **8.4M parameters**). Training artifacts and weights are committed in this repository, including `model.safetensors`, tokenizer files, and the checkpoint.
+Agron's initial LLM has now been trained **from scratch** on WikiText-2 using an 8-layer, 512-dim, 4-head LLaMA-style architecture (about **50.3M parameters**). Training artifacts and weights are committed in this repository, including `model.safetensors`, tokenizer files, and the checkpoints.
 
 Future recursive self-improvement can fine-tune or grow this base model.
+
+## Interface
+
+The Gradio app is a HUD-style neural interface:
+
+- **Command Console** — the chat surface, backed by the base model plus an optional
+  instruction-tuned voice model (`AGRON_VOICE_MODEL`, on by default, ~6 GB)
+- **Telemetry strip** — live interaction, tool and training counters
+- **Action log** — timestamped results of every command, kept separate from the
+  telemetry strip so it is never overwritten by the status refresh
+- **SYSTEM / TOOLS / LEARNING tabs** — diagnostics, the tool registry (run and
+  create), and all learning controls
+
+The page scrolls normally, so every control stays reachable on small viewports.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGRON_VOICE_MODEL` | `Qwen/Qwen2.5-3B-Instruct` | Instruction model used for chat |
+| `AGRON_USE_VOICE` | `1` | Set to `0` to run on the native base model only |
+| `AGRON_AUTO_PUSH` | `1` | Set to `0` to disable auto-push of learned weights |
+| `AGRON_WORK_DIR` | `/content` | Scratch dir for training artifacts |
+| `AGRON_PORT` / `AGRON_HOST` | `7860` / `0.0.0.0` | Bind address |
+| `AGRON_SHARE` | `0` | Set to `1` for a public gradio.live share link |
 
 ## Cybersecurity Focus
 

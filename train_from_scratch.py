@@ -23,6 +23,23 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TOKENIZER_FILE = os.path.join(ROOT, "tokenizer.json")
 
 
+def _work_dir():
+    """Writable scratch dir for training artifacts."""
+    for cand in [os.environ.get("AGRON_WORK_DIR"), "/content", os.path.join(ROOT, "workspace")]:
+        if not cand:
+            continue
+        try:
+            os.makedirs(cand, exist_ok=True)
+            probe = os.path.join(cand, ".agron_write_probe")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+            return cand
+        except Exception:
+            continue
+    return ROOT
+
+
 def tokenize_dataset(tok, text_list, block_size=256):
     tokenized = tok(text_list, truncation=False)["input_ids"]
     chunks = []
@@ -69,7 +86,7 @@ def main():
 
     train_ds = tokenize_dataset(tok, texts, block_size=256)
 
-    out_dir = args.output or os.path.join("/content", f"agron-scratch-{args.size}")
+    out_dir = args.output or os.path.join(_work_dir(), f"agron-scratch-{args.size}")
     os.makedirs(out_dir, exist_ok=True)
 
     ta = TrainingArguments(

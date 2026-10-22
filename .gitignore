@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.gradio/
+workspace/
+memory/scratch_corpus.txt
