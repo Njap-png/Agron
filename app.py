@@ -1,5 +1,6 @@
 import os
 import json
+import sys
 import time
 import random
 import threading
@@ -12,6 +13,19 @@ import gradio as gr
 from datasets import Dataset
 from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast, Trainer, TrainingArguments, DataCollatorForLanguageModeling
 from safetensors.torch import load_file, save_file
+
+from agron_nets import (
+    ARCHITECTURES,
+    RECIPES,
+    algorithm_names,
+    architecture_names,
+    build_architecture,
+    count_parameters,
+    format_parameters,
+    optimizer_names,
+    scheduler_names,
+)
+from agron_nets.training import AgronTrainer, TrainerConfig, get_recipe, recipe_names
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 MEMORY_DIR = os.path.join(ROOT, "memory")
@@ -50,6 +64,28 @@ SHARE = os.environ.get("AGRON_SHARE", "0").strip().lower() in ("1", "true", "yes
 IO_LOCK = threading.Lock()
 TRAIN_LOCK = threading.Lock()
 
+# --------------------------------------------------------------------------- #
+# Neural-network zoo selection
+# --------------------------------------------------------------------------- #
+# The reference checkpoint is a 50.3M-parameter LLaMA; the same preset is used
+# for every other architecture so they are directly comparable at runtime.
+AGRON_PRESET = dict(
+    vocab_size=16384,
+    hidden_size=512,
+    intermediate_size=2048,
+    num_hidden_layers=8,
+    num_attention_heads=4,
+    num_key_value_heads=4,
+    max_position_embeddings=512,
+    bos_token_id=0,
+    eos_token_id=2,
+    pad_token_id=1,
+    tie_word_embeddings=False,
+)
+ACTIVE_ARCH = os.environ.get("AGRON_ARCH", "llama").strip().lower()
+if ACTIVE_ARCH not in ARCHITECTURES:
+    ACTIVE_ARCH = "llama"
+
 interactions = []
 training_state = {"running": False, "steps": 0, "last": "idle", "count_at_train": 0}
 LAST_TRAIN_TIME = 0.0
@@ -75,7 +111,13 @@ def git_auto_push(message, paths):
         return False, "auto-push disabled (AGRON_AUTO_PUSH=0)"
     try:
         for p in paths:
-            subprocess.run(["git", "-C", ROOT, "add", p], check=False)
+            subprocess.run(["git", "-C", ROOT, "add", "--", p], check=False)
+        staged = subprocess.run(
+            ["git", "-C", ROOT, "diff", "--cached", "--name-only"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if not staged:
+            return True, "no changes to push"
         status = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"],
                                 capture_output=True, text=True, check=True).stdout.strip()
         if not status:
@@ -136,24 +178,37 @@ def build_tokenizer():
     return tok
 
 
-def build_model():
-    cfg = LlamaConfig(
-        vocab_size=16384,
-        hidden_size=512,
-        intermediate_size=2048,
-        num_hidden_layers=8,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        max_position_embeddings=512,
-        bos_token_id=0,
-        eos_token_id=2,
-        pad_token_id=1,
-        tie_word_embeddings=False,
-    )
-    model = LlamaForCausalLM(cfg)
-    state = load_file(os.path.join(ROOT, "model.safetensors"))
-    model.load_state_dict(state)
+def build_model(arch=None, load_published=True):
+    """Build one architecture from the zoo and load the best weights available.
+
+    ``llama`` keeps loading the published ``model.safetensors`` so the shipped
+    Agron brain is preserved. Every other architecture loads its own latest
+    checkpoint from ``WORK_DIR`` when one exists.
+    """
+    arch = (arch or ACTIVE_ARCH or "llama").strip().lower()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if arch == "llama":
+        model, _ = build_architecture("llama", **AGRON_PRESET)
+        weights = os.path.join(ROOT, "model.safetensors")
+        if load_published and os.path.exists(weights):
+            try:
+                model.load_state_dict(load_file(weights))
+                print("Loaded published Agron weights:", weights)
+            except Exception as exc:
+                print("Published weights incompatible, using fresh init:", exc)
+    else:
+        model, _ = build_architecture(arch, **AGRON_PRESET)
+        saved = os.path.join(WORK_DIR, f"agron-{arch}", "final")
+        if load_published and os.path.exists(os.path.join(saved, "config.json")):
+            try:
+                from transformers import AutoModelForCausalLM
+
+                model = AutoModelForCausalLM.from_pretrained(saved)
+                print(f"Loaded {arch} checkpoint: {saved}")
+            except Exception as exc:
+                print(f"Could not load {arch} checkpoint, using fresh init:", exc)
+
     model.to(device)
     model.eval()
     return model, device
@@ -378,57 +433,158 @@ def generate_response(message, history):
     return response
 
 
-def learn_from_interactions():
+def zoo_summary():
+    """Human-readable inventory of everything the zoo can build."""
+    arch_lines = "\n".join(
+        f"- **{name}** — {ARCHITECTURES[name]['label']}: {ARCHITECTURES[name]['description']}"
+        for name in architecture_names()
+    )
+    return (
+        f"**{len(ARCHITECTURES)} architectures · {len(optimizer_names())} optimisers · "
+        f"{len(algorithm_names())} algorithms · {len(scheduler_names())} schedules · "
+        f"{len(RECIPES)} recipes**\n\n{arch_lines}"
+    )
+
+
+def _resolve_zoo(optimizer=None, scheduler=None, recipe=None, algorithms=None):
+    """Recipe values win unless the caller explicitly overrides them."""
+    if recipe and recipe not in ("custom", "none", ""):
+        entry = get_recipe(recipe)
+        return entry["optimizer"], entry["scheduler"], list(entry["algorithms"])
+    return (optimizer or "adamw"), (scheduler or "cosine"), list(algorithms or [])
+
+
+def _lm_loader(chunks, batch_size=2, block=None):
+    """Wrap token blocks in a DataLoader whose batches satisfy the engine."""
+
+    def collate(rows):
+        input_ids = torch.tensor([r["input_ids"] for r in rows], dtype=torch.long)
+        labels = input_ids.clone()
+        labels = labels.masked_fill(labels == TOKENIZER.pad_token_id, -100)
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": torch.ones_like(input_ids),
+        }
+
+    return torch.utils.data.DataLoader(chunks, batch_size=batch_size, shuffle=True, collate_fn=collate)
+
+
+def reload_live_model(model_dir):
+    """Swap the live model for the freshly saved one, whatever the architecture."""
+    global MODEL, DEVICE
+    try:
+        from transformers import AutoModelForCausalLM
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        fresh = AutoModelForCausalLM.from_pretrained(model_dir)
+        fresh.to(device)
+        fresh.eval()
+        with IO_LOCK:
+            MODEL = fresh
+            DEVICE = device
+        return True
+    except Exception as exc:
+        print("live reload failed:", exc)
+        return False
+
+
+def switch_architecture(arch):
+    """Rebuild the runtime brain with another architecture from the zoo."""
+    global MODEL, DEVICE, ACTIVE_ARCH
+    arch = (arch or "").strip().lower()
+    if arch not in ARCHITECTURES:
+        return f"unknown architecture: {arch}"
+    with IO_LOCK:
+        MODEL, DEVICE = build_model(arch, load_published=True)
+        ACTIVE_ARCH = arch
+    label = ARCHITECTURES[arch]["label"]
+    training_state["last"] = f"brain switched to {label}"
+    return f"brain switched to {label} · {format_parameters(count_parameters(MODEL))} params on {DEVICE}"
+
+
+def _save_repo_weights(model_dir):
+    """Only the llama brain maps onto the published ``model.safetensors``."""
+    if ACTIVE_ARCH != "llama":
+        return False
+    src = os.path.join(model_dir, "model.safetensors")
+    if not os.path.exists(src):
+        return False
+    import shutil
+
+    shutil.copyfile(src, os.path.join(ROOT, "model.safetensors"))
+    return True
+
+
+def _train_chunks_with_engine(chunks, steps, out_dir, optimizer="adamw", scheduler="cosine",
+                              algorithms=None):
+    """Fine-tune the live model in place through the Agron engine."""
+    os.makedirs(out_dir, exist_ok=True)
+    trainer = AgronTrainer(
+        MODEL,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        algorithms=list(algorithms or []),
+        config=TrainerConfig(max_steps=int(steps), log_every=0, output_dir=out_dir),
+        device=DEVICE,
+    )
+    report = trainer.fit(_lm_loader(chunks, batch_size=2))
+    MODEL.eval()
+    model_dir = os.path.join(out_dir, "final")
+    MODEL.save_pretrained(model_dir)
+    return report, model_dir
+
+
+def learn_from_interactions(optimizer=None, scheduler=None, recipe=None, algorithms=None, steps=30):
     global MODEL
     if not TRAIN_LOCK.acquire(blocking=False):
         return
     try:
+        if len(interactions) < 2:
+            training_state["last"] = "need at least 2 interactions before training"
+            return
         training_state["running"] = True
         training_state["last"] = "training"
+        optimizer, scheduler, algorithms = _resolve_zoo(optimizer, scheduler, recipe, algorithms)
+
         texts = [f"User: {r['user']}\nAgron: {r['assistant']}\n" for r in interactions]
-        combined = "\n".join(texts)
-        toks = TOKENIZER(combined)["input_ids"]
+        toks = TOKENIZER(" ".join(texts))["input_ids"]
         block = 64
-        chunks = [toks[i:i+block] for i in range(0, max(1, len(toks) - block + 1), block)]
-        # ensure full-size chunks
-        chunks = [c for c in chunks if len(c) == block]
+        chunks = [toks[i:i + block] for i in range(0, max(1, len(toks) - block + 1), block)]
+        chunks = [{"input_ids": c} for c in chunks if len(c) == block]
         if not chunks:
-            pad = [TOKENIZER.pad_token_id] * (block - len(toks))
-            chunks = [toks + pad]
-        ds = Dataset.from_dict({"input_ids": chunks, "labels": [c[:] for c in chunks]})
-        out_dir = os.path.join(WORK_DIR, "agron-learned")
-        os.makedirs(out_dir, exist_ok=True)
-        args = TrainingArguments(
-            output_dir=out_dir,
-            per_device_train_batch_size=2,
-            max_steps=30,
-            learning_rate=1e-4,
-            optim="adamw_torch",
-            fp16=True if torch.cuda.is_available() else False,
-            logging_steps=10,
-            save_strategy="no",
-            report_to=[],
-            remove_unused_columns=True,
+            pad = [TOKENIZER.pad_token_id] * max(0, block - len(toks))
+            chunks = [{"input_ids": toks + pad}]
+
+        out_dir = os.path.join(WORK_DIR, f"agron-{ACTIVE_ARCH}", "finetune")
+        trainer = AgronTrainer(
+            MODEL,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            algorithms=algorithms,
+            config=TrainerConfig(max_steps=steps, log_every=0, output_dir=out_dir),
+            device=DEVICE,
         )
-        collator = DataCollatorForLanguageModeling(tokenizer=TOKENIZER, mlm=False)
-        trainer = Trainer(model=MODEL, args=args, train_dataset=ds, data_collator=collator, processing_class=TOKENIZER)
-        trainer.train()
-        # reload weights from trained model
-        with IO_LOCK:
-            state = MODEL.state_dict()
-            # Trainer mutated in place; persist to file
-            save_file({k: v.detach().cpu().contiguous() for k, v in state.items()}, os.path.join(out_dir, "model.safetensors"))
-            MODEL.load_state_dict(torch.load(os.path.join(out_dir, "pytorch_model.bin"), map_location=DEVICE) if os.path.exists(os.path.join(out_dir, "pytorch_model.bin")) else state)
-        # persist trained weights to the repo-tracked file
-        import shutil
-        shutil.copyfile(os.path.join(out_dir, "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
-        training_state["steps"] += 30
+        report = trainer.fit(_lm_loader(chunks, batch_size=2))
+        model_dir = os.path.join(WORK_DIR, f"agron-{ACTIVE_ARCH}", "final")
+        MODEL.eval()
+        MODEL.save_pretrained(model_dir)
+
+        trained_file = os.path.join(model_dir, "model.safetensors")
+        if ACTIVE_ARCH == "llama" and os.path.exists(trained_file):
+            import shutil
+
+            shutil.copyfile(trained_file, os.path.join(ROOT, "model.safetensors"))
+        training_state["steps"] += report["steps"]
         training_state["count_at_train"] = len(interactions)
-        # auto-push the re-trained weights + memory to Hugging Face
+
+        push_paths = [f"memory/interactions.jsonl"]
+        if ACTIVE_ARCH == "llama":
+            push_paths.insert(0, "model.safetensors")
         try:
             ok, detail = git_auto_push(
-                f"Agron auto-learn ({len(interactions)} interactions)",
-                ["model.safetensors", "memory/interactions.jsonl"],
+                f"Agron auto-learn ({len(interactions)} interactions, {ACTIVE_ARCH}/{optimizer})",
+                push_paths,
             )
             if "conversation memory" not in learned_topics:
                 learned_topics.append("conversation memory")
@@ -437,7 +593,7 @@ def learn_from_interactions():
         except Exception as pe:
             training_state["last"] = f"push error: {str(pe)[:150]}"
     except Exception as e:
-        training_state["last"] = f"learn error: {str(e)[:120]}"
+        training_state["last"] = f"learn error: {str(e)[:200]}"
     finally:
         training_state["running"] = False
         TRAIN_LOCK.release()
@@ -682,33 +838,19 @@ def learn_dictionary():
         chunks = [c for c in chunks if len(c) == block]
         if not chunks:
             chunks = [toks[:block] + [TOKENIZER.pad_token_id] * (block - min(block, len(toks)))]
-        ds = Dataset.from_dict({"input_ids": chunks, "labels": [c[:] for c in chunks]})
+        ds = [{"input_ids": c} for c in chunks]
         out_dir = os.path.join(WORK_DIR, "agron-dictionary")
+        optimizer, scheduler, algorithms = _resolve_zoo()
         os.makedirs(out_dir, exist_ok=True)
-        args = TrainingArguments(
-            output_dir=out_dir,
-            per_device_train_batch_size=2,
-            max_steps=80,
-            learning_rate=1e-4,
-            optim="adamw_torch",
-            fp16=True if torch.cuda.is_available() else False,
-            logging_steps=20,
-            save_strategy="no",
-            report_to=[],
-            remove_unused_columns=True,
-        )
-        collator = DataCollatorForLanguageModeling(tokenizer=TOKENIZER, mlm=False)
-        trainer = Trainer(model=MODEL, args=args, train_dataset=ds, data_collator=collator, processing_class=TOKENIZER)
         training_state["last"] = f"training on {len(lines)} definitions..."
-        trainer.train()
-        save_file({k: v.detach().cpu().contiguous() for k, v in MODEL.state_dict().items()}, os.path.join(out_dir, "model.safetensors"))
-        import shutil
-        shutil.copyfile(os.path.join(out_dir, "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
+        report, model_dir = _train_chunks_with_engine(ds, 80, out_dir, optimizer, scheduler, algorithms)
+        _save_repo_weights(model_dir)
         # push
         training_state["last"] = "pushing dictionary model..."
+        push_paths = ["memory/interactions.jsonl"] + (["model.safetensors"] if ACTIVE_ARCH == "llama" else [])
         ok, detail = git_auto_push(
-            f"Agron dictionary learning ({len(lines)} words)",
-            ["model.safetensors", "memory/interactions.jsonl"],
+            f"Agron dictionary learning ({len(lines)} words, {ACTIVE_ARCH})",
+            push_paths,
         )
         training_state["last"] = f"dictionary learned · {detail}"
         learned_topics.append("dictionary words")
@@ -807,32 +949,18 @@ def learn_web(topic):
         chunks = [c for c in chunks if len(c) == block]
         if not chunks:
             raise RuntimeError("not enough web text")
-        ds = Dataset.from_dict({"input_ids": chunks, "labels": [c[:] for c in chunks]})
+        ds = [{"input_ids": c} for c in chunks]
         out_dir = os.path.join(WORK_DIR, "agron-web")
+        optimizer, scheduler, algorithms = _resolve_zoo()
         os.makedirs(out_dir, exist_ok=True)
-        args = TrainingArguments(
-            output_dir=out_dir,
-            per_device_train_batch_size=2,
-            max_steps=60,
-            learning_rate=1e-4,
-            optim="adamw_torch",
-            fp16=True if torch.cuda.is_available() else False,
-            logging_steps=20,
-            save_strategy="no",
-            report_to=[],
-            remove_unused_columns=True,
-        )
-        collator = DataCollatorForLanguageModeling(tokenizer=TOKENIZER, mlm=False)
-        trainer = Trainer(model=MODEL, args=args, train_dataset=ds, data_collator=collator, processing_class=TOKENIZER)
         training_state["last"] = f"training on web content for '{topic}'..."
-        trainer.train()
-        save_file({k: v.detach().cpu().contiguous() for k, v in MODEL.state_dict().items()}, os.path.join(out_dir, "model.safetensors"))
-        import shutil
-        shutil.copyfile(os.path.join(out_dir, "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
+        report, model_dir = _train_chunks_with_engine(ds, 60, out_dir, optimizer, scheduler, algorithms)
+        _save_repo_weights(model_dir)
         training_state["last"] = "pushing web-learned model..."
+        push_paths = ["memory/interactions.jsonl"] + (["model.safetensors"] if ACTIVE_ARCH == "llama" else [])
         ok, detail = git_auto_push(
-            f"Agron web learning: {topic}",
-            ["model.safetensors", "memory/interactions.jsonl"],
+            f"Agron web learning: {topic} ({ACTIVE_ARCH})",
+            push_paths,
         )
         learned_topics.append(f"web: {topic}")
         persist_topics()
@@ -1071,8 +1199,9 @@ register_builtin_tools()
 load_tools()
 
 
-def learn_from_scratch_memory():
-    global MODEL, LAST_TRAIN_TIME
+def learn_from_scratch_memory(arch=None, optimizer=None, scheduler=None, recipe=None,
+                              algorithms=None, steps=300):
+    global MODEL, LAST_TRAIN_TIME, ACTIVE_ARCH
     if not TRAIN_LOCK.acquire(blocking=False):
         return
     training_state["running"] = True
@@ -1080,36 +1209,57 @@ def learn_from_scratch_memory():
     try:
         if len(interactions) < 6:
             raise RuntimeError(f"need at least 6 interactions (have {len(interactions)})")
+        arch = (arch or ACTIVE_ARCH or "llama").strip().lower()
+        optimizer, scheduler, algorithm_list = _resolve_zoo(optimizer, scheduler, recipe, algorithms)
+
         corpus = os.path.join(MEMORY_DIR, "scratch_corpus.txt")
         lines = [f"User: {r['user']}\nAgron: {r['assistant']}" for r in interactions]
         with open(corpus, "w", encoding="utf-8") as f:
             f.write("\n\n".join(lines))
-        out_dir = os.path.join(WORK_DIR, "agron-from-scratch-memory")
-        training_state["last"] = f"training from scratch on {len(interactions)} interactions..."
-        subprocess.run([
-            "python3", os.path.join(ROOT, "train_from_scratch.py"),
-            "--size", "current", "--steps", "300",
+
+        out_dir = os.path.join(WORK_DIR, f"agron-scratch-{arch}")
+        training_state["last"] = f"training {arch} from scratch on {len(interactions)} interactions..."
+
+        cmd = [
+            sys.executable, os.path.join(ROOT, "train_from_scratch.py"),
+            "--size", "current", "--steps", str(int(steps)),
             "--dataset", "file", "--file", corpus,
-            "--output", out_dir
-        ], check=True, timeout=600)
-        import shutil
-        shutil.copyfile(os.path.join(out_dir, "final", "model.safetensors"), os.path.join(ROOT, "model.safetensors"))
-        # reload weights into the live model
-        try:
-            st = load_file(os.path.join(ROOT, "model.safetensors"))
-            with IO_LOCK:
-                MODEL.load_state_dict(st)
-        except Exception:
-            pass
-        learned_topics.append("from-scratch memory model")
+            "--output", out_dir,
+            "--arch", arch,
+            "--optimizer", optimizer,
+            "--scheduler", scheduler,
+            "--block-size", "256",
+        ]
+        if recipe and recipe not in ("custom", "none"):
+            cmd += ["--recipe", recipe]
+        for name in algorithm_list:
+            cmd += ["--algorithm", name]
+
+        subprocess.run(cmd, check=True, timeout=1800)
+
+        final_dir = os.path.join(out_dir, "final")
+        if reload_live_model(final_dir):
+            ACTIVE_ARCH = arch
+        if arch == "llama":
+            import shutil
+
+            shutil.copyfile(os.path.join(final_dir, "model.safetensors"),
+                            os.path.join(ROOT, "model.safetensors"))
+
+        learned_topics.append(f"from-scratch {arch} model")
         persist_topics()
         training_state["last"] = "self-updating from scratch..."
+        push_paths = ["memory/scratch_corpus.txt", "memory/learned_topics.json"]
+        if arch == "llama":
+            push_paths.insert(0, "model.safetensors")
         ok, detail = git_auto_push(
-            f"Agron from-scratch learning ({len(interactions)} interactions)",
-            ["model.safetensors", "memory/scratch_corpus.txt", "memory/learned_topics.json"],
+            f"Agron from-scratch learning ({arch}, {optimizer}, {len(interactions)} interactions)",
+            push_paths,
         )
         LAST_TRAIN_TIME = time.time()
-        training_state["last"] = f"from-scratch learned · {detail} ({len(interactions)} interactions)"
+        training_state["last"] = (
+            f"from-scratch {arch} learned · {detail} ({len(interactions)} interactions)"
+        )
     except Exception as e:
         training_state["last"] = f"from-scratch error: {str(e)[:200]}"
     finally:
@@ -1118,16 +1268,21 @@ def learn_from_scratch_memory():
 
 
 
-FACTORY_RESET_PATHS = [
-    os.path.join(WORK_DIR, n) for n in (
-        "agron-model", "agron-learned", "agron-web", "agron-dictionary",
-        "agron-from-scratch-memory", "agron-scratch-small", "agron-scratch-current",
-    )
-]
+FACTORY_RESET_PATHS = (
+    [
+        os.path.join(WORK_DIR, n)
+        for n in (
+            "agron-model", "agron-learned", "agron-web", "agron-dictionary",
+            "agron-from-scratch-memory", "agron-scratch-small", "agron-scratch-current",
+        )
+    ]
+    + [os.path.join(WORK_DIR, f"agron-{name}") for name in architecture_names()]
+    + [os.path.join(WORK_DIR, f"agron-scratch-{name}") for name in architecture_names()]
+)
 
 
 def factory_reset():
-    global MODEL, interactions, learned_topics
+    global MODEL, DEVICE, ACTIVE_ARCH, interactions, learned_topics
     stop_self_evolution()
     with IO_LOCK:
         interactions = []
@@ -1159,20 +1314,17 @@ def factory_reset():
     for d in FACTORY_RESET_PATHS:
         if os.path.exists(d):
             shutil.rmtree(d, ignore_errors=True)
-    # reinitialize Agron base model with fresh random weights (no pretrained load)
+    # reinitialize the active Agron architecture with fresh random weights
     try:
-        from transformers import LlamaConfig, LlamaForCausalLM
-        cfg = LlamaConfig(vocab_size=16384, hidden_size=512, intermediate_size=2048, num_hidden_layers=8, num_attention_heads=4, num_key_value_heads=4, max_position_embeddings=512, bos_token_id=0, eos_token_id=2, pad_token_id=1, tie_word_embeddings=False)
-        MODEL = LlamaForCausalLM(cfg)
-        if torch.cuda.is_available():
-            MODEL = MODEL.to("cuda")
-        MODEL.eval()
+        MODEL, DEVICE = build_model(ACTIVE_ARCH, load_published=False)
     except Exception as e:
         training_state["last"] = f"reset model error: {str(e)[:120]}"
     globals()["LAST_TRAIN_TIME"] = time.time()
     training_state["running"] = False
     training_state["steps"] = 0
-    training_state["last"] = "factory reset complete - fresh base model initialized"
+    training_state["last"] = (
+        f"factory reset complete - fresh {ARCHITECTURES[ACTIVE_ARCH]['label']} initialised"
+    )
     return "factory reset complete"
 
 
@@ -1208,7 +1360,9 @@ def system_snapshot():
             gpu = ""
     voice = "on" if VOICE_MODEL is not None else "off"
     return (
-        f"params: {n_params / 1e6:.1f}M  ·  device: {DEVICE}{gpu}  ·  voice model: {voice}\n"
+        f"params: {n_params / 1e6:.1f}M  ·  arch: {ACTIVE_ARCH}  ·  device: {DEVICE}{gpu}  ·  voice model: {voice}\n"
+        f"zoo: {len(ARCHITECTURES)} networks · {len(optimizer_names())} optimisers · "
+        f"{len(algorithm_names())} algorithms · {len(RECIPES)} recipes\n"
         f"work dir: {WORK_DIR}\n"
         f"topics: {len(learned_topics)}  ·  auto-push: {'on' if AUTO_PUSH else 'off'}"
     )
@@ -1238,6 +1392,14 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
                 with gr.Tab("SYSTEM"):
                     sys_status = gr.Textbox(value=training_state["last"], label="Pipeline", interactive=False, elem_classes="status-box", lines=2)
                     metrics = gr.Textbox(value=system_snapshot(), label="Diagnostics", interactive=False, lines=4)
+                    with gr.Row():
+                        arch_dd = gr.Dropdown(
+                            choices=architecture_names(),
+                            value=ACTIVE_ARCH,
+                            label="Architecture",
+                        )
+                        arch_btn = gr.Button("Load brain", variant="secondary")
+                    zoo_info = gr.Markdown(zoo_summary())
                 with gr.Tab("TOOLS"):
                     tool_dd = gr.Dropdown(choices=list_tool_names(), value=(list_tool_names()[0] if list_tool_names() else None), label="Select tool")
                     tool_in = gr.Textbox(placeholder="Tool input...", label="Tool input", lines=1)
@@ -1253,6 +1415,22 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
                     web_topic = gr.Textbox(label="Web topic / search query", placeholder="e.g. transformer architecture", lines=1)
                     web_btn = gr.Button("Search & learn web")
                     with gr.Row():
+                        recipe_dd = gr.Dropdown(
+                            choices=["custom"] + recipe_names(),
+                            value="custom",
+                            label="Recipe",
+                        )
+                        optimizer_dd = gr.Dropdown(
+                            choices=optimizer_names(), value="adamw", label="Optimiser"
+                        )
+                        scheduler_dd = gr.Dropdown(
+                            choices=scheduler_names(), value="cosine", label="Scheduler"
+                        )
+                    algorithm_cb = gr.CheckboxGroup(
+                        choices=algorithm_names(), value=[], label="Algorithms (composable)"
+                    )
+                    steps_num = gr.Number(value=300, label="Steps", precision=0)
+                    with gr.Row():
                         evolve_btn = gr.Button("Start self-evolution")
                         stop_evolve_btn = gr.Button("Stop")
                     with gr.Row():
@@ -1267,13 +1445,25 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
         history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": response}]
         return history, ""
 
-    def do_learn():
+    def do_switch(arch):
+        return log_action(switch_architecture(arch)), system_snapshot()
+
+    def do_learn(optimizer, scheduler, recipe, algorithms, steps):
         if training_state["running"]:
             return log_action(f"training already running · {training_state['last']}")
         if len(interactions) < 2:
             return log_action(f"need at least 2 interactions (have {len(interactions)})")
-        threading.Thread(target=learn_from_interactions, daemon=True).start()
-        return log_action("memory training started in background")
+        threading.Thread(
+            target=learn_from_interactions,
+            kwargs=dict(optimizer=optimizer, scheduler=scheduler, recipe=recipe,
+                        algorithms=list(algorithms or []), steps=int(steps or 30)),
+            daemon=True,
+        ).start()
+        opt, sched, algos = _resolve_zoo(optimizer, scheduler, recipe, algorithms)
+        return log_action(
+            f"memory training started in background · {ACTIVE_ARCH}/{opt}/{sched}"
+            + (f" · {', '.join(algos)}" if algos else "")
+        )
 
     def refresh_status():
         return status_line(), training_state["last"], system_snapshot()
@@ -1281,6 +1471,7 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
     send.click(respond, [msg, chatbot], [chatbot, msg])
     msg.submit(respond, [msg, chatbot], [chatbot, msg])
     clear.click(lambda: ([], ""), outputs=[chatbot, msg])
+    arch_btn.click(do_switch, arch_dd, [action_log, metrics])
     def do_dict():
         if training_state["running"]:
             return log_action("training already running")
@@ -1306,15 +1497,28 @@ with gr.Blocks(title="Agron Neural Interface") as demo:
         return gr.Dropdown(choices=choices, value=(choices[0] if choices else None))
     tool_btn.click(run_tool_fn, [tool_dd, tool_in], tool_out)
     create_btn.click(create_tool_fn, tool_desc, action_log)
-    learn_btn.click(do_learn, outputs=action_log)
-    def do_scratch():
+    learn_btn.click(do_learn, [optimizer_dd, scheduler_dd, recipe_dd, algorithm_cb, steps_num], outputs=action_log)
+    def do_scratch(arch, optimizer, scheduler, recipe, algorithms, steps):
         if training_state["running"]:
             return log_action("training already running")
         if len(interactions) < 6:
             return log_action(f"need at least 6 interactions (have {len(interactions)})")
-        threading.Thread(target=learn_from_scratch_memory, daemon=True).start()
-        return log_action("from-scratch training started in background")
-    scratch_btn.click(do_scratch, outputs=action_log)
+        threading.Thread(
+            target=learn_from_scratch_memory,
+            kwargs=dict(arch=arch, optimizer=optimizer, scheduler=scheduler, recipe=recipe,
+                        algorithms=list(algorithms or []), steps=int(steps or 300)),
+            daemon=True,
+        ).start()
+        opt, sched, algos = _resolve_zoo(optimizer, scheduler, recipe, algorithms)
+        return log_action(
+            f"from-scratch training started: {arch} · {opt}/{sched}"
+            + (f" · {', '.join(algos)}" if algos else "")
+        )
+    scratch_btn.click(
+        do_scratch,
+        [arch_dd, optimizer_dd, scheduler_dd, recipe_dd, algorithm_cb, steps_num],
+        outputs=action_log,
+    )
     dict_btn.click(do_dict, outputs=action_log)
     web_btn.click(do_web, outputs=action_log)
     def do_evolve():
