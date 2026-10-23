@@ -24,6 +24,19 @@ from .transformer import (
     AgronTransformerConfig,
     AgronTransformerForCausalLM,
 )
+from .deepmoe import AgronDeepMoEConfig, AgronDeepMoEForCausalLM
+from .encoder_decoder import (
+    AgronEncDecConfig,
+    AgronEncDecForConditionalGeneration,
+    AgronBartForConditionalGeneration,
+    AgronT5ForConditionalGeneration,
+)
+from .retnet import AgronRetNetConfig, AgronRetNetForCausalLM
+from .rwkv import AgronRWKVConfig, AgronRWKVForCausalLM
+from .gla import AgronGLAConfig, AgronGLAForCausalLM
+from .deltanet import AgronDeltaNetConfig, AgronDeltaNetForCausalLM
+from .xlstm import AgronxLSTMConfig, AgronxLSTMForCausalLM
+from .mamba2 import AgronMamba2Config, AgronMamba2ForCausalLM
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
 
 
@@ -130,6 +143,106 @@ ARCHITECTURES: Dict[str, Dict[str, Any]] = {
         "model_cls": AgronMixerForCausalLM,
         "attention": False,
         "recurrent": False,
+    },
+    "deepmoe": {
+        "name": "deepmoe",
+        "label": "Deep MoE (Mixtral-style)",
+        "family": "sparse-transformer",
+        "description": "Enhanced MoE with 8 experts, top-2 routing, shared expert, load balancing, router z-loss, and noise injection.",
+        "config_cls": AgronDeepMoEConfig,
+        "model_cls": AgronDeepMoEForCausalLM,
+        "attention": True,
+        "recurrent": False,
+    },
+    "encdec": {
+        "name": "encdec",
+        "label": "Encoder-Decoder (T5/BART)",
+        "family": "encoder-decoder",
+        "description": "Bidirectional encoder with cross-attention to causal decoder. Great for translation/summarization/seq2seq.",
+        "config_cls": AgronEncDecConfig,
+        "model_cls": AgronEncDecForConditionalGeneration,
+        "attention": True,
+        "recurrent": False,
+    },
+    "bart": {
+        "name": "bart",
+        "label": "BART-style Encoder-Decoder",
+        "family": "encoder-decoder",
+        "description": "BART-like bidirectional encoder + autoregressive decoder with cross-attention.",
+        "config_cls": AgronEncDecConfig,
+        "model_cls": AgronBartForConditionalGeneration,
+        "attention": True,
+        "recurrent": False,
+    },
+    "t5": {
+        "name": "t5",
+        "label": "T5-style Encoder-Decoder",
+        "family": "encoder-decoder",
+        "description": "T5-like encoder-decoder with pre-norm blocks and shared embeddings by default.",
+        "config_cls": AgronEncDecConfig,
+        "model_cls": AgronT5ForConditionalGeneration,
+        "attention": True,
+        "recurrent": False,
+    },
+    "retnet": {
+        "name": "retnet",
+        "label": "RetNet (Retention)",
+        "family": "retention",
+        "description": "Multi-scale retention with parallel training and recurrent inference. O(L) complexity.",
+        "config_cls": AgronRetNetConfig,
+        "model_cls": AgronRetNetForCausalLM,
+        "attention": False,
+        "recurrent": True,
+    },
+    "rwkv": {
+        "name": "rwkv",
+        "label": "RWKV (Time-Mixing)",
+        "family": "rwkv",
+        "description": "WKV linear recurrence trained in parallel. Transformer-like quality with RNN inference cost.",
+        "config_cls": AgronRWKVConfig,
+        "model_cls": AgronRWKVForCausalLM,
+        "attention": False,
+        "recurrent": True,
+    },
+    "gla": {
+        "name": "gla",
+        "label": "Gated Linear Attention",
+        "family": "linear-attention",
+        "description": "Data-dependent gated linear attention with chunkwise parallelism.",
+        "config_cls": AgronGLAConfig,
+        "model_cls": AgronGLAForCausalLM,
+        "attention": False,
+        "recurrent": True,
+    },
+    "deltanet": {
+        "name": "deltanet",
+        "label": "DeltaNet (Fast Weights)",
+        "family": "linear-attention",
+        "description": "Delta-rule recurrence for better associative recall with linear complexity.",
+        "config_cls": AgronDeltaNetConfig,
+        "model_cls": AgronDeltaNetForCausalLM,
+        "attention": False,
+        "recurrent": True,
+    },
+    "xlstm": {
+        "name": "xlstm",
+        "label": "xLSTM (Extended LSTM)",
+        "family": "xlstm",
+        "description": "Modern LSTM with exponential gating, matrix memory and improved scalability.",
+        "config_cls": AgronxLSTMConfig,
+        "model_cls": AgronxLSTMForCausalLM,
+        "attention": False,
+        "recurrent": True,
+    },
+    "mamba2": {
+        "name": "mamba2",
+        "label": "Mamba-2 (SSD)",
+        "family": "state-space",
+        "description": "State Space Duality selective SSM with better GPU utilization than Mamba-1.",
+        "config_cls": AgronMamba2Config,
+        "model_cls": AgronMamba2ForCausalLM,
+        "attention": False,
+        "recurrent": True,
     },
 }
 
